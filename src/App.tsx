@@ -1,10 +1,23 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Store, Package, Users, Truck, ShoppingCart, 
-  MessageSquare, Mic, Volume2, Search, CheckCircle2, XCircle, 
-  Clock, ArrowRight, DollarSign, RefreshCw, Send, 
-  FileText, Plus, ShieldCheck, MapPin, Phone, Lock, User, LogOut, ArrowLeft, Sparkles, Trash2, Check
+import {
+  Store, Package, Users, Truck, ShoppingCart,
+  MessageSquare, Mic, Volume2, CheckCircle2, XCircle,
+  Clock, ArrowRight, DollarSign, RefreshCw, Send,
+  FileText, Plus, ShieldCheck, MapPin, Sparkles, Check,
+  Square, Pause, X,
 } from 'lucide-react';
+import { formatDuration, isMediaRecordingSupported, MAX_CLIENT_RECORD_MS, pickRecorderMimeType } from './voice/mediaSupport';
+import {
+  AlertBanner,
+  AuthLayout,
+  EmptyState,
+  KpiCard,
+  ModalFrame,
+  PortalHeader,
+  StatusBadge,
+  StockMeter,
+  TabRail,
+} from './ui/system';
 
 interface Wholesaler {
   id: string;
@@ -31,13 +44,14 @@ interface Product {
   reorderPoint: number;
   stockOnHand: number;
   stockReserved: number;
-  status: 'available' | 'low_stock' | 'out_of_stock';
+  availableStock?: number;
+  status: 'available' | 'low_stock' | 'out_of_stock' | 'inactive' | string;
 }
 
 interface SubOrder {
   id: string;
   wholesalerId: string;
-  items: { productId: string; name: string; quantity: number; unitPrice: number; unit: string }[];
+  items: { productId: string; name: string; quantity: number; unitPrice: number; costPrice?: number; unit: string }[];
   subtotal: number;
   status: string;
   rejectReason?: string;
@@ -59,22 +73,44 @@ interface Order {
 interface Shipment {
   id: string;
   orderId: string;
+  subOrderId?: string | null;
   wholesalerId: string;
   assigneeId?: string;
   assigneeName?: string;
   status: string;
   expectedDate: string;
   proofNotes?: string;
+  trackingRef?: string;
+  clientName?: string;
+  deliveryAddress?: string;
+  failureReason?: string;
 }
 
 interface Invoice {
   id: string;
+  invoiceNumber?: string;
   orderId: string;
+  subOrderId?: string;
   wholesalerId: string;
+  wholesalerName?: string;
+  clientId?: string;
+  clientName?: string;
   amount: number;
   paidAmount: number;
+  outstandingAmount?: number;
   status: string;
   createdAt: string;
+  issuedAt?: string;
+  lines?: { id: string; name: string; quantity: number; unitPrice: string; lineTotal: string; unit: string; packSize: string }[];
+}
+
+interface PaymentRecord {
+  id: string;
+  amount: string;
+  method: string;
+  reference: string | null;
+  createdAt: string;
+  allocations: { invoiceId: string; amount: string }[];
 }
 
 interface AuditEvent {
@@ -92,8 +128,15 @@ interface ChatMessage {
   audioPlayable?: boolean;
   language?: string;
   products?: Product[];
+  cartPreview?: { itemCount: number; subtotal: number; lines: { name: string; quantity: number; lineTotal: number }[] };
+  needsConfirmation?: boolean;
+  error?: boolean;
+  retryText?: string;
+  ttsNote?: string;
   timestamp: string;
 }
+
+type VoiceUiState = 'idle' | 'recording' | 'preview' | 'transcribing' | 'review' | 'submitting';
 
 export default function App() {
   const [navState, setNavState] = useState<string>('gateway');
@@ -114,7 +157,14 @@ export default function App() {
   const [adminPassword, setAdminPassword] = useState('admin123');
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(false);
 
+  // Delivery Auth
+  const [deliveryEmail, setDeliveryEmail] = useState('delivery@market.pk');
+  const [deliveryPassword, setDeliveryPassword] = useState('delivery123');
+  const [currentDelivery, setCurrentDelivery] = useState<{ id: string; name: string; email: string | null } | null>(null);
+
   const [authError, setAuthError] = useState('');
+  const [authToken, setAuthToken] = useState('');
+  const authTokenRef = useRef('');
 
   // Backend Data
   const [wholesalers, setWholesalers] = useState<Wholesaler[]>([]);
@@ -122,17 +172,38 @@ export default function App() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
+  const [paymentForm, setPaymentForm] = useState({ invoiceId: '', amount: '', method: 'cash', reference: '' });
+  const [paymentBusy, setPaymentBusy] = useState(false);
 
   // Client Tabs & Cart
   const [clientTab, setClientTab] = useState<'chat' | 'catalog' | 'orders' | 'invoices'>('chat');
   const [cart, setCart] = useState<{ [productId: string]: number }>({});
+  const [cartSubtotal, setCartSubtotal] = useState(0);
   const [deliveryAddress, setDeliveryAddress] = useState<string>('Babar General Store, University Road, Peshawar');
   const [checkoutModal, setCheckoutModal] = useState<boolean>(false);
+  const [cartBusy, setCartBusy] = useState(false);
+  const [checkoutError, setCheckoutError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [orderBusy, setOrderBusy] = useState(false);
 
   // Wholesaler Tabs
   const [wholesalerTab, setWholesalerTab] = useState<'dashboard' | 'products' | 'suborders'>('dashboard');
+  const [productForm, setProductForm] = useState({
+    sku: '',
+    name: '',
+    unit: 'carton',
+    packSize: '',
+    costPrice: '',
+    sellingPrice: '',
+    moq: '1',
+    reorderPoint: '10',
+    stockOnHand: '0',
+  });
+  const [productBusy, setProductBusy] = useState(false);
 
   // Admin Tabs & New Wholesaler Modal
   const [adminTab, setAdminTab] = useState<'overview' | 'wholesalers' | 'dispatch' | 'audit' | 'all_orders'>('overview');
@@ -142,27 +213,121 @@ export default function App() {
   // AI Chat State
   const [chatLanguage, setChatLanguage] = useState<'en' | 'ur' | 'ps'>('ur');
   const [chatInput, setChatInput] = useState<string>('');
+  const [conversationId, setConversationId] = useState<string>('');
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([
     {
       sender: 'ai',
-      text: 'السلام علیکم! Welcome to Peshawar General Store & Drinks Wholesale Hub. How can I assist your store stock today?',
+      text: 'السلام علیکم! Welcome to Peshawar General Store & Drinks Wholesale Hub. Ask in English, اردو, پښتو, or Roman Urdu — I search live stock and update your cart (orders still need your checkout confirmation).',
       language: 'ur',
       timestamp: new Date().toLocaleTimeString()
     }
   ]);
   const [isAiLoading, setIsAiLoading] = useState<boolean>(false);
+  const [chatError, setChatError] = useState('');
   const chatScrollRef = useRef<HTMLDivElement>(null);
+
+  // Voice assistant state
+  const [voiceState, setVoiceState] = useState<VoiceUiState>('idle');
+  const [voiceError, setVoiceError] = useState('');
+  const [recordingMs, setRecordingMs] = useState(0);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [transcriptDraft, setTranscriptDraft] = useState('');
+  const [transcriptId, setTranscriptId] = useState('');
+  const [transcriptLanguage, setTranscriptLanguage] = useState<'en' | 'ur' | 'ps' | 'mixed'>('en');
+  const [voiceBusyNote, setVoiceBusyNote] = useState('');
+  const [transcriptionSucceeded, setTranscriptionSucceeded] = useState(false);
+  const [voiceReviewMode, setVoiceReviewMode] = useState(false);
+  const [playingMsgIdx, setPlayingMsgIdx] = useState<number | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const recordStartedAtRef = useRef(0);
+  const recordTimerRef = useRef<number | null>(null);
+  const recordLimitRef = useRef<number | null>(null);
+  const audioBlobRef = useRef<Blob | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const cancelRecordingRef = useRef(false);
+  const voiceReviewModeRef = useRef(false);
+  const conversationIdRef = useRef('');
+  const chatLanguageRef = useRef(chatLanguage);
+  const voiceSupported = typeof window !== 'undefined' && isMediaRecordingSupported();
+  const secureContext =
+    typeof window !== 'undefined' && (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+
+  useEffect(() => {
+    voiceReviewModeRef.current = voiceReviewMode;
+  }, [voiceReviewMode]);
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+  useEffect(() => {
+    chatLanguageRef.current = chatLanguage;
+  }, [chatLanguage]);
+
+  const storeAuthToken = (token?: string) => {
+    const value = token || '';
+    authTokenRef.current = value;
+    setAuthToken(value);
+  };
+
+  const authHeaders = (json = true): HeadersInit => {
+    const headers: Record<string, string> = {};
+    if (json) headers['Content-Type'] = 'application/json';
+    if (authTokenRef.current) headers.Authorization = `Bearer ${authTokenRef.current}`;
+    return headers;
+  };
+
+  const handleLogout = () => {
+    storeAuthToken('');
+    setCurrentClient(null);
+    setCurrentWholesaler(null);
+    setCurrentDelivery(null);
+    setIsAdminLoggedIn(false);
+    setCart({});
+    setCartSubtotal(0);
+    setCheckoutError('');
+    setActionError('');
+    setSelectedInvoice(null);
+    setConversationId('');
+    setChatError('');
+    setChatHistory([
+      {
+        sender: 'ai',
+        text: 'السلام علیکم! Welcome to Peshawar General Store & Drinks Wholesale Hub. Ask in English, اردو, پښتو, or Roman Urdu — I search live stock and update your cart (orders still need your checkout confirmation).',
+        language: 'ur',
+        timestamp: new Date().toLocaleTimeString(),
+      },
+    ]);
+    setNavState('gateway');
+  };
+
+  const applyCartPayload = (cartPayload: any) => {
+    if (!cartPayload) {
+      setCart({});
+      setCartSubtotal(0);
+      return;
+    }
+    const next: { [productId: string]: number } = {};
+    for (const item of cartPayload.items || []) {
+      next[item.productId] = item.quantity;
+    }
+    setCart(next);
+    setCartSubtotal(Number(cartPayload.subtotal || 0));
+  };
 
   const fetchData = async () => {
     try {
-      const res = await fetch('/api/market/data');
+      const res = await fetch('/api/market/data', { headers: authHeaders(false) });
       const data = await res.json();
       setWholesalers(data.wholesalers || []);
       setProducts(data.products || []);
       setOrders(data.orders || []);
       setShipments(data.shipments || []);
       setInvoices(data.invoices || []);
+      setPayments(data.payments || []);
       setAuditEvents(data.auditEvents || []);
+      applyCartPayload(data.cart);
       setLoading(false);
     } catch (err) {
       console.error('Failed to fetch data', err);
@@ -196,8 +361,11 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
+        storeAuthToken(data.token);
         setCurrentClient(data.client);
         setNavState('client_portal');
+        fetchData();
+        loadConversationHistory(data.token);
       } else {
         setAuthError(data.error || 'Signup failed.');
       }
@@ -221,8 +389,11 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
+        storeAuthToken(data.token);
         setCurrentClient(data.client);
         setNavState('client_portal');
+        fetchData();
+        loadConversationHistory(data.token);
       } else {
         setAuthError(data.error || 'Client not found.');
       }
@@ -242,8 +413,10 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
+        storeAuthToken(data.token);
         setCurrentWholesaler(data.wholesaler);
         setNavState('wholesaler_portal');
+        fetchData();
       } else {
         setAuthError(data.error || 'Wrong email or password.');
       }
@@ -263,8 +436,10 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
+        storeAuthToken(data.token);
         setIsAdminLoggedIn(true);
         setNavState('admin_portal');
+        fetchData();
       } else {
         setAuthError(data.error || 'Wrong admin email or password.');
       }
@@ -273,105 +448,767 @@ export default function App() {
     }
   };
 
-  // Cart operations
-  const addToCart = (productId: string, qty: number = 1) => {
-    setCart(prev => ({ ...prev, [productId]: (prev[productId] || 0) + qty }));
+  const handleDeliverySignin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    try {
+      const res = await fetch('/api/auth/delivery/signin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: deliveryEmail, password: deliveryPassword }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        storeAuthToken(data.token);
+        setCurrentDelivery(data.delivery);
+        setNavState('delivery_portal');
+        fetchData();
+      } else {
+        setAuthError(data.error || 'Wrong delivery email or password.');
+      }
+    } catch {
+      setAuthError('Delivery sign in failed.');
+    }
   };
 
-  const updateCartQty = (productId: string, qty: number) => {
-    setCart(prev => {
-      const copy = { ...prev };
-      if (qty <= 0) delete copy[productId];
-      else copy[productId] = qty;
-      return copy;
-    });
+  // Cart operations (server-backed; prices/totals never trusted from client math for checkout)
+  const addToCart = async (productId: string, qty: number = 1) => {
+    setCartBusy(true);
+    setActionError('');
+    try {
+      const res = await fetch('/api/cart/items', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ productId, quantity: qty }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Could not add item to cart.');
+        return;
+      }
+      applyCartPayload(data.cart);
+    } catch {
+      setActionError('Network error while updating cart.');
+    } finally {
+      setCartBusy(false);
+    }
+  };
+
+  const updateCartQty = async (productId: string, qty: number) => {
+    setCartBusy(true);
+    setCheckoutError('');
+    try {
+      const res = await fetch('/api/cart/items', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ productId, quantity: qty, mode: 'set' }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setCheckoutError(data.error || 'Could not update cart quantity.');
+        return;
+      }
+      applyCartPayload(data.cart);
+    } catch {
+      setCheckoutError('Network error while updating cart.');
+    } finally {
+      setCartBusy(false);
+    }
   };
 
   const totalCartItemsCount = Object.values(cart).reduce((a, b) => a + b, 0);
 
   const submitOrder = async () => {
-    const cartItems = Object.keys(cart).map(productId => ({ productId, quantity: cart[productId] }));
-    if (cartItems.length === 0) return;
+    if (totalCartItemsCount === 0 || orderBusy) return;
+    setOrderBusy(true);
+    setCheckoutError('');
+    const idempotencyKey = `CHK-${currentClient?.id || 'client'}-${Date.now()}`;
     try {
       const res = await fetch('/api/orders', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...authHeaders(), 'Idempotency-Key': idempotencyKey },
         body: JSON.stringify({
-          clientId: currentClient?.id || 'CLI-01',
-          clientName: currentClient?.storeName || 'Babar General Store',
           deliveryAddress,
-          cartItems
-        })
+          confirmed: true,
+          idempotencyKey,
+        }),
       });
       const data = await res.json();
-      if (data.success) {
-        setCart({});
-        setCheckoutModal(false);
-        fetchData();
-        alert(`Order ${data.order.id} submitted successfully!`);
+      if (!res.ok || !data.success) {
+        setCheckoutError(data.error || 'Order submission failed.');
+        return;
       }
-    } catch (err) {
-      console.error('Order submission error', err);
+      setCart({});
+      setCartSubtotal(0);
+      setCheckoutModal(false);
+      await fetchData();
+      alert(`Order ${data.order.id} submitted successfully!`);
+    } catch {
+      setCheckoutError('Network error while placing order.');
+    } finally {
+      setOrderBusy(false);
     }
   };
 
-  const handleSendMessage = async () => {
-    if (!chatInput.trim()) return;
-    const userMsg: ChatMessage = { sender: 'user', text: chatInput, timestamp: new Date().toLocaleTimeString() };
-    setChatHistory(prev => [...prev, userMsg]);
-    const query = chatInput;
+  const loadConversationHistory = async (tokenOverride?: string) => {
+    const headers: HeadersInit = {};
+    const token = tokenOverride || authTokenRef.current;
+    if (token) headers.Authorization = `Bearer ${token}`;
+    try {
+      const listRes = await fetch('/api/ai/conversations', { headers });
+      if (!listRes.ok) return;
+      const listData = await listRes.json();
+      const latest = listData.conversations?.[0];
+      if (!latest) return;
+      setConversationId(latest.id);
+      const msgRes = await fetch(`/api/ai/conversations/${latest.id}/messages`, { headers });
+      if (!msgRes.ok) return;
+      const msgData = await msgRes.json();
+      if (!msgData.messages?.length) return;
+      setChatHistory(
+        msgData.messages.map((m: any) => ({
+          sender: m.role === 'user' ? 'user' : 'ai',
+          text: m.content,
+          language: m.language,
+          needsConfirmation: Boolean(m.metadata?.needsConfirmation),
+          timestamp: m.createdAt ? new Date(m.createdAt).toLocaleTimeString() : new Date().toLocaleTimeString(),
+        }))
+      );
+    } catch {
+      // keep welcome message
+    }
+  };
+
+  const handleSendMessage = async (overrideText?: string) => {
+    const query = (overrideText ?? chatInput).trim();
+    if (!query || isAiLoading) return;
+    if (!authTokenRef.current || !currentClient) {
+      setChatError('Sign in as a shopkeeper to use the AI assistant.');
+      return;
+    }
+
+    const userMsg: ChatMessage = { sender: 'user', text: query, timestamp: new Date().toLocaleTimeString() };
+    setChatHistory((prev) => [...prev, userMsg]);
     setChatInput('');
+    setChatError('');
     setIsAiLoading(true);
 
     try {
       const res = await fetch('/api/ai/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: query, language: chatLanguage })
+        headers: authHeaders(),
+        body: JSON.stringify({ message: query, language: chatLanguage, conversationId: conversationId || undefined }),
       });
       const data = await res.json();
-      setChatHistory(prev => [...prev, {
-        sender: 'ai',
-        text: data.reply,
-        audioPlayable: true,
-        language: data.detectedLanguage,
-        products: data.suggestedProducts,
-        timestamp: new Date().toLocaleTimeString()
-      }]);
-    } catch (err) {
-      setChatHistory(prev => [...prev, {
-        sender: 'ai',
-        text: 'Sorry, AI assistant is temporarily busy. Please check our conventional product catalog.',
-        timestamp: new Date().toLocaleTimeString()
-      }]);
+      if (!res.ok) {
+        setChatHistory((prev) => [
+          ...prev,
+          {
+            sender: 'ai',
+            text: data.error || 'AI request failed. Tap retry or try again.',
+            error: true,
+            retryText: query,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
+        setChatError(data.error || 'AI request failed.');
+        return;
+      }
+
+      if (data.conversationId) setConversationId(data.conversationId);
+      if (data.cart) applyCartPayload(data.cart);
+      if (data.action?.type === 'refresh_cart' || data.cart) await fetchData();
+      if (data.needsConfirmation || data.action?.type === 'open_checkout') {
+        setCheckoutModal(true);
+      }
+
+      const cartPreview =
+        data.cart && data.cart.itemCount > 0
+          ? {
+              itemCount: data.cart.itemCount,
+              subtotal: Number(data.cart.subtotal || 0),
+              lines: (data.cart.items || []).map((i: any) => ({
+                name: i.product?.name || i.productId,
+                quantity: i.quantity,
+                lineTotal: Number(i.lineTotal || 0),
+              })),
+            }
+          : undefined;
+
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          sender: 'ai',
+          text: data.reply,
+          language: data.detectedLanguage,
+          products: data.suggestedProducts,
+          cartPreview,
+          needsConfirmation: Boolean(data.needsConfirmation),
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ]);
+    } catch {
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          sender: 'ai',
+          text: 'Sorry, the assistant is temporarily unavailable. Your catalog and cart still work — retry this message when ready.',
+          error: true,
+          retryText: query,
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ]);
+      setChatError('Network error talking to the AI assistant.');
     } finally {
       setIsAiLoading(false);
     }
   };
 
-  const reviewSubOrder = async (subOrderId: string, action: 'Approved' | 'Rejected') => {
+  const clearRecordingTimers = () => {
+    if (recordTimerRef.current) {
+      window.clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+    if (recordLimitRef.current) {
+      window.clearTimeout(recordLimitRef.current);
+      recordLimitRef.current = null;
+    }
+  };
+
+  const stopMediaTracks = () => {
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+  };
+
+  const resetVoiceSession = (keepError = false) => {
+    clearRecordingTimers();
+    stopMediaTracks();
+    mediaRecorderRef.current = null;
+    chunksRef.current = [];
+    audioBlobRef.current = null;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl(null);
+    setRecordingMs(0);
+    setVoiceState('idle');
+    setTranscriptDraft('');
+    setTranscriptId('');
+    setVoiceBusyNote('');
+    setTranscriptionSucceeded(false);
+    if (!keepError) setVoiceError('');
+    cancelRecordingRef.current = false;
+  };
+
+  const appendAssistantFromApi = async (data: any, userText: string, userLang?: string) => {
+    setChatHistory((prev) => [
+      ...prev,
+      { sender: 'user', text: userText, timestamp: new Date().toLocaleTimeString(), language: userLang },
+    ]);
+    if (data.conversationId) setConversationId(data.conversationId);
+    if (data.cart) applyCartPayload(data.cart);
+    if (data.action?.type === 'refresh_cart' || data.cart) await fetchData();
+    if (data.needsConfirmation || data.action?.type === 'open_checkout') setCheckoutModal(true);
+
+    const cartPreview =
+      data.cart && data.cart.itemCount > 0
+        ? {
+            itemCount: data.cart.itemCount,
+            subtotal: Number(data.cart.subtotal || 0),
+            lines: (data.cart.items || []).map((i: any) => ({
+              name: i.product?.name || i.productId,
+              quantity: i.quantity,
+              lineTotal: Number(i.lineTotal || 0),
+            })),
+          }
+        : undefined;
+
+    setChatHistory((prev) => [
+      ...prev,
+      {
+        sender: 'ai',
+        text: data.reply,
+        language: data.detectedLanguage,
+        products: data.suggestedProducts,
+        cartPreview,
+        needsConfirmation: Boolean(data.needsConfirmation),
+        audioPlayable: true,
+        ttsNote: data.fallbackReason || (data.geminiUsed ? undefined : 'Deterministic agents (Gemini unavailable).'),
+        timestamp: new Date().toLocaleTimeString(),
+      },
+    ]);
+  };
+
+  const processAutoVoice = async (blob: Blob, durationMs: number) => {
+    setVoiceError('');
+    setVoiceState('transcribing');
+    setVoiceBusyNote('Uploading & transcribing…');
+    setIsAiLoading(true);
     try {
-      await fetch(`/api/suborders/${subOrderId}/review`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, rejectReason: action === 'Rejected' ? 'Stock temporarily limited' : undefined })
+      if (blob.size < 256) {
+        setVoiceError('Recording was empty. Hold the mic longer, then stop — or type your request.');
+        setVoiceState('idle');
+        return;
+      }
+      const form = new FormData();
+      const mime = blob.type || 'audio/webm';
+      const ext = mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : mime.includes('wav') ? 'wav' : 'webm';
+      form.append('audio', blob, `recording.${ext}`);
+      form.append('durationMs', String(durationMs));
+      form.append('language', chatLanguageRef.current);
+      if (conversationIdRef.current) form.append('conversationId', conversationIdRef.current);
+      form.append('submissionKey', `AUTO-${Date.now()}-${Math.floor(Math.random() * 10000)}`);
+
+      const res = await fetch('/api/ai/voice/auto', {
+        method: 'POST',
+        headers: authTokenRef.current ? { Authorization: `Bearer ${authTokenRef.current}` } : {},
+        body: form,
       });
-      fetchData();
-    } catch (err) {
-      console.error('Review suborder error', err);
+      const data = await res.json();
+      if (!res.ok) {
+        setVoiceError(data.error || 'Voice upload failed.');
+        setVoiceState('idle');
+        return;
+      }
+
+      if (data.autoSent && data.reply) {
+        await appendAssistantFromApi(data, data.userText || data.transcript, data.detectedLanguage);
+        resetVoiceSession();
+        return;
+      }
+
+      // Failed STT / empty / quota — manual fallback (never fabricate text)
+      if (data.conversationId) setConversationId(data.conversationId);
+      setTranscriptId(data.transcriptId || '');
+      setTranscriptDraft('');
+      setTranscriptionSucceeded(false);
+      setTranscriptLanguage(data.detectedLanguage || chatLanguageRef.current);
+      setVoiceError(
+        data.error ||
+          (data.errorCode === 'quota'
+            ? 'Gemini quota reached (429). Type what you said below, or use text chat. Ordering still works.'
+            : 'Could not transcribe that recording. Type what you said below — nothing was auto-sent.')
+      );
+      setVoiceState('review');
+    } catch {
+      setVoiceError('Network error during voice upload. Type your request instead.');
+      setVoiceState('idle');
+    } finally {
+      setIsAiLoading(false);
+      setVoiceBusyNote('');
+    }
+  };
+
+  const startVoiceRecording = async () => {
+    setVoiceError('');
+    if (!authTokenRef.current || !currentClient) {
+      setVoiceError('Sign in as a shopkeeper to use voice.');
+      return;
+    }
+    if (!secureContext) {
+      setVoiceError('Microphone requires localhost or HTTPS (secure context).');
+      return;
+    }
+    if (!voiceSupported) {
+      setVoiceError('This browser does not support microphone recording. Use Chrome/Edge/Safari or type instead.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      mediaStreamRef.current = stream;
+      const mimeType = pickRecorderMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      chunksRef.current = [];
+      cancelRecordingRef.current = false;
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+      };
+      recorder.onerror = () => {
+        setVoiceError('Recording failed. Please try again or type your request.');
+        resetVoiceSession(true);
+      };
+      recorder.onstop = () => {
+        clearRecordingTimers();
+        stopMediaTracks();
+        const elapsed = Date.now() - recordStartedAtRef.current;
+        if (cancelRecordingRef.current) {
+          resetVoiceSession();
+          return;
+        }
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || mimeType || 'audio/webm' });
+        audioBlobRef.current = blob;
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        const url = URL.createObjectURL(blob);
+        setPreviewUrl(url);
+        setRecordingMs(elapsed);
+
+        if (blob.size < 256) {
+          setVoiceError('Recording produced no audio data. Check the mic and try again, or type instead.');
+          setVoiceState('idle');
+          return;
+        }
+
+        if (voiceReviewModeRef.current) {
+          setVoiceState('preview');
+          return;
+        }
+        // WhatsApp-style: auto upload → STT → AI
+        void processAutoVoice(blob, elapsed);
+      };
+
+      // timeslice keeps chunks flowing so stop() is less likely to yield 0 bytes
+      recorder.start(200);
+      recordStartedAtRef.current = Date.now();
+      setRecordingMs(0);
+      setVoiceState('recording');
+      recordTimerRef.current = window.setInterval(() => {
+        setRecordingMs(Date.now() - recordStartedAtRef.current);
+      }, 200);
+      recordLimitRef.current = window.setTimeout(() => {
+        stopVoiceRecording();
+      }, MAX_CLIENT_RECORD_MS);
+    } catch (err: any) {
+      const name = err?.name || '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setVoiceError('Microphone permission denied. Allow mic access or type your order instead.');
+      } else if (name === 'NotFoundError') {
+        setVoiceError('No microphone found on this device.');
+      } else {
+        setVoiceError('Could not start recording. Try again or use text chat.');
+      }
+      resetVoiceSession(true);
+    }
+  };
+
+  const stopVoiceRecording = () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state !== 'recording') return;
+    try {
+      // Flush final chunk before stop (browser-dependent but helps nonempty blobs)
+      if (typeof recorder.requestData === 'function') recorder.requestData();
+    } catch {
+      // ignore
+    }
+    recorder.stop();
+  };
+
+  const cancelVoiceRecording = () => {
+    cancelRecordingRef.current = true;
+    if (mediaRecorderRef.current?.state === 'recording') {
+      try {
+        if (typeof mediaRecorderRef.current.requestData === 'function') mediaRecorderRef.current.requestData();
+      } catch {
+        // ignore
+      }
+      mediaRecorderRef.current.stop();
+    } else {
+      resetVoiceSession();
+    }
+  };
+
+  /** Review mode: upload → STT only → editable transcript → user Send (no auto AI). */
+  const uploadAndTranscribeForReview = async () => {
+    const blob = audioBlobRef.current;
+    if (!blob) return;
+    setVoiceError('');
+    setVoiceState('transcribing');
+    setVoiceBusyNote('Transcribing for review…');
+    setIsAiLoading(true);
+    try {
+      if (blob.size < 256) {
+        setVoiceError('Recording was empty. Re-record or type your request.');
+        setVoiceState('idle');
+        return;
+      }
+      const form = new FormData();
+      const mime = blob.type || 'audio/webm';
+      const ext = mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : mime.includes('wav') ? 'wav' : 'webm';
+      form.append('audio', blob, `recording.${ext}`);
+      form.append('durationMs', String(recordingMs || Date.now() - recordStartedAtRef.current));
+      form.append('language', chatLanguageRef.current);
+      if (conversationIdRef.current) form.append('conversationId', conversationIdRef.current);
+
+      const res = await fetch('/api/ai/voice/transcribe', {
+        method: 'POST',
+        headers: authTokenRef.current ? { Authorization: `Bearer ${authTokenRef.current}` } : {},
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setVoiceError(data.error || 'Transcription upload failed.');
+        setVoiceState('preview');
+        return;
+      }
+      if (data.conversationId) setConversationId(data.conversationId);
+      setTranscriptId(data.transcriptId || '');
+      setTranscriptionSucceeded(Boolean(data.transcriptionSucceeded));
+      setTranscriptLanguage(data.detectedLanguage || chatLanguageRef.current);
+      setTranscriptDraft(data.transcriptionSucceeded ? String(data.transcript || '') : '');
+      if (!data.transcriptionSucceeded) {
+        setVoiceError(
+          data.error ||
+            (data.errorCode === 'quota'
+              ? 'Gemini quota reached (429). Type what you said below, or use text chat.'
+              : 'Could not transcribe. Type what you said below — nothing was auto-sent.')
+        );
+      } else {
+        setVoiceError('');
+      }
+      setVoiceState('review');
+    } catch {
+      setVoiceError('Network error during transcription. Type your request instead.');
+      setVoiceState('idle');
+    } finally {
+      setIsAiLoading(false);
+      setVoiceBusyNote('');
+    }
+  };
+
+  const submitReviewedVoice = async () => {
+    const edited = transcriptDraft.trim();
+    if (!edited || !transcriptId || voiceState === 'submitting') return;
+    setVoiceState('submitting');
+    setVoiceBusyNote('Sending to assistant…');
+    setIsAiLoading(true);
+    const submissionKey = `VOICE-${transcriptId}-${Date.now()}`;
+    try {
+      const res = await fetch('/api/ai/voice/submit', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          transcriptId,
+          editedTranscript: edited,
+          conversationId: conversationId || undefined,
+          language: transcriptLanguage || chatLanguage,
+          submissionKey,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setVoiceError(data.error || 'Could not submit transcript.');
+        setVoiceState('review');
+        return;
+      }
+      if (data.duplicate) {
+        setVoiceError('This recording was already submitted. Record a new message if needed.');
+        resetVoiceSession(true);
+        return;
+      }
+      await appendAssistantFromApi(data, edited, transcriptLanguage);
+      resetVoiceSession();
+    } catch {
+      setVoiceError('Network error submitting transcript.');
+      setVoiceState('review');
+    } finally {
+      setIsAiLoading(false);
+      setVoiceBusyNote('');
+    }
+  };
+
+  const playAssistantTts = async (msg: ChatMessage, idx: number) => {
+    if (msg.sender !== 'ai' || !msg.text) return;
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
+      if (playingMsgIdx === idx) {
+        setPlayingMsgIdx(null);
+        return;
+      }
+    }
+    try {
+      const res = await fetch('/api/ai/voice/tts', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          text: msg.text,
+          language: msg.language || chatLanguage,
+          conversationId: conversationId || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok || !data.audioBase64) {
+        setChatHistory((prev) =>
+          prev.map((m, i) =>
+            i === idx
+              ? {
+                  ...m,
+                  ttsNote:
+                    data.fallbackReason ||
+                    'Voice playback unavailable for this language. Read the text reply instead.',
+                }
+              : m
+          )
+        );
+        return;
+      }
+      const audio = new Audio(`data:${data.mimeType || 'audio/wav'};base64,${data.audioBase64}`);
+      ttsAudioRef.current = audio;
+      setPlayingMsgIdx(idx);
+      if (data.fallbackReason || data.nativeLanguageReliable === false) {
+        setChatHistory((prev) =>
+          prev.map((m, i) => (i === idx ? { ...m, ttsNote: data.fallbackReason || 'Playback may not match native pronunciation.' } : m))
+        );
+      }
+      audio.onended = () => setPlayingMsgIdx(null);
+      await audio.play();
+    } catch {
+      setChatHistory((prev) =>
+        prev.map((m, i) => (i === idx ? { ...m, ttsNote: 'Could not play voice. Text reply still works.' } : m))
+      );
+    }
+  };
+
+  const reviewSubOrder = async (subOrderId: string, action: 'Approved' | 'Rejected') => {
+    setActionError('');
+    try {
+      const res = await fetch(`/api/suborders/${subOrderId}/review`, {
+        method: 'PATCH',
+        headers: authHeaders(),
+        body: JSON.stringify({ action, rejectReason: action === 'Rejected' ? 'Stock temporarily limited' : undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Could not review suborder.');
+        return;
+      }
+      await fetchData();
+    } catch {
+      setActionError('Network error while reviewing suborder.');
+    }
+  };
+
+  const createWholesalerProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setProductBusy(true);
+    setActionError('');
+    try {
+      const res = await fetch('/api/products', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          sku: productForm.sku,
+          name: productForm.name,
+          unit: productForm.unit,
+          packSize: productForm.packSize,
+          costPrice: Number(productForm.costPrice),
+          sellingPrice: Number(productForm.sellingPrice),
+          moq: Number(productForm.moq),
+          reorderPoint: Number(productForm.reorderPoint),
+          stockOnHand: Number(productForm.stockOnHand),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Could not create product.');
+        return;
+      }
+      setProductForm({
+        sku: '',
+        name: '',
+        unit: 'carton',
+        packSize: '',
+        costPrice: '',
+        sellingPrice: '',
+        moq: '1',
+        reorderPoint: '10',
+        stockOnHand: '0',
+      });
+      await fetchData();
+    } catch {
+      setActionError('Network error while creating product.');
+    } finally {
+      setProductBusy(false);
+    }
+  };
+
+  const deactivateWholesalerProduct = async (productId: string) => {
+    setActionError('');
+    try {
+      const res = await fetch(`/api/products/${productId}/deactivate`, {
+        method: 'POST',
+        headers: authHeaders(false),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Could not deactivate product.');
+        return;
+      }
+      await fetchData();
+    } catch {
+      setActionError('Network error while deactivating product.');
     }
   };
 
   const assignShipment = async (shipmentId: string) => {
+    setActionError('');
     try {
-      await fetch(`/api/shipments/${shipmentId}/assign`, {
+      const res = await fetch(`/api/shipments/${shipmentId}/assign`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ assigneeId: 'DRV-01', assigneeName: 'Gul Khan Logistics' })
+        headers: authHeaders(),
+        body: JSON.stringify({ assigneeId: 'DRV-01', assigneeName: 'Gul Khan Logistics' }),
       });
-      fetchData();
-    } catch (err) {
-      console.error('Assign error', err);
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Could not assign shipment.');
+        return;
+      }
+      await fetchData();
+    } catch {
+      setActionError('Network error while assigning shipment.');
+    }
+  };
+
+  const updateShipmentStatus = async (shipmentId: string, status: string, extra: Record<string, string> = {}) => {
+    setActionError('');
+    try {
+      const idempotencyKey = `SHP-${shipmentId}-${status}-${Date.now()}`;
+      const res = await fetch(`/api/shipments/${shipmentId}/status`, {
+        method: 'PATCH',
+        headers: { ...authHeaders(), 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({ status, idempotencyKey, ...extra }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Could not update delivery status.');
+        return;
+      }
+      await fetchData();
+    } catch {
+      setActionError('Network error while updating delivery.');
+    }
+  };
+
+  const recordInvoicePayment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!paymentForm.invoiceId || !paymentForm.amount) return;
+    setPaymentBusy(true);
+    setActionError('');
+    try {
+      const idempotencyKey = `PAY-${paymentForm.invoiceId}-${paymentForm.amount}-${Date.now()}`;
+      const res = await fetch('/api/payments', {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({
+          invoiceId: paymentForm.invoiceId,
+          amount: paymentForm.amount,
+          method: paymentForm.method,
+          reference: paymentForm.reference,
+          idempotencyKey,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Payment recording failed.');
+        return;
+      }
+      setPaymentForm({ invoiceId: '', amount: '', method: 'cash', reference: '' });
+      await fetchData();
+    } catch {
+      setActionError('Network error while recording payment.');
+    } finally {
+      setPaymentBusy(false);
     }
   };
 
@@ -380,7 +1217,7 @@ export default function App() {
     try {
       await fetch(`/api/wholesalers/${id}/status`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ status: newStatus })
       });
       fetchData();
@@ -392,7 +1229,7 @@ export default function App() {
   const deleteWholesaler = async (id: string) => {
     if (!confirm('Are you sure you want to remove/delete this wholesaler tenant?')) return;
     try {
-      await fetch(`/api/wholesalers/${id}`, { method: 'DELETE' });
+      await fetch(`/api/wholesalers/${id}`, { method: 'DELETE', headers: authHeaders(false) });
       fetchData();
     } catch (err) {
       console.error('Delete error', err);
@@ -404,7 +1241,7 @@ export default function App() {
     try {
       const res = await fetch('/api/wholesalers', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(newWholesalerForm)
       });
       const data = await res.json();
@@ -420,10 +1257,11 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-[#502A40] flex items-center justify-center text-[#F6F0E8]">
-        <div className="text-center space-y-4">
-          <RefreshCw className="w-10 h-10 animate-spin mx-auto text-[#C7A67C]" />
-          <p className="text-lg font-serif">Loading Wholesale Platform...</p>
+      <div className="min-h-screen bg-brand flex items-center justify-center text-canvas">
+        <div className="text-center space-y-4 px-6">
+          <RefreshCw className="w-9 h-9 animate-spin mx-auto text-accent" />
+          <p className="text-lg font-serif font-semibold tracking-tight">Loading wholesale platform…</p>
+          <p className="text-xs text-accent/80">Connecting secure portals and live catalog</p>
         </div>
       </div>
     );
@@ -432,108 +1270,113 @@ export default function App() {
   // ================= 1. GATEWAY HOMEPAGE =================
   if (navState === 'gateway') {
     return (
-      <div className="min-h-screen bg-[#F6F0E8] text-[#502A40] flex flex-col font-sans selection:bg-[#C7A67C] selection:text-white">
-        <header className="bg-[#502A40] text-[#F6F0E8] py-6 px-8 shadow-md">
-          <div className="max-w-7xl mx-auto flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-12 h-12 rounded-2xl bg-[#C7A67C] flex items-center justify-center shadow-lg text-[#502A40]">
-                <Store className="w-7 h-7" />
+      <div className="app-shell">
+        <header className="portal-header !static">
+          <div className="max-w-7xl w-full mx-auto flex items-center justify-between gap-4 px-1">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="portal-brand-mark !w-12 !h-12 !rounded-2xl">
+                <Store className="w-6 h-6" />
               </div>
-              <div>
-                <h1 className="text-2xl font-serif font-bold tracking-wide">Peshawar General Store & Drinks Wholesale</h1>
-                <p className="text-xs text-[#C7A67C] tracking-widest uppercase">Elite B2B Wholesale Marketplace</p>
+              <div className="min-w-0">
+                <h1 className="font-serif font-bold text-lg sm:text-xl tracking-tight truncate">Peshawar General Store & Drinks Wholesale</h1>
+                <p className="text-[10px] sm:text-xs text-accent tracking-[0.18em] uppercase">B2B wholesale · AI ordering · live stock</p>
               </div>
             </div>
-            <div className="hidden md:flex items-center space-x-6 text-sm text-[#F6F0E8]/80 font-serif">
-              <span>Secure Portals</span>
-              <span>•</span>
-              <span>Beverages & Groceries</span>
-              <span>•</span>
-              <span>Multi-Agent AI</span>
+            <div className="hidden lg:flex items-center gap-4 text-xs text-canvas/75 font-medium">
+              <span>Shopkeepers</span>
+              <span className="text-accent">·</span>
+              <span>Wholesalers</span>
+              <span className="text-accent">·</span>
+              <span>Dispatch</span>
             </div>
           </div>
         </header>
 
-        <section className="relative py-16 px-6 bg-[#502A40] text-white overflow-hidden">
-          <div className="absolute inset-0 opacity-25 mix-blend-overlay bg-cover bg-center" style={{ backgroundImage: `url('https://images.unsplash.com/photo-1578916171728-46686eac8d58?auto=format&fit=crop&w=1600&q=80')` }}></div>
-          <div className="max-w-5xl mx-auto relative z-10 text-center space-y-6">
-            <span className="bg-[#C7A67C]/20 border border-[#C7A67C]/40 text-[#C7A67C] px-4 py-1.5 rounded-full text-xs font-serif uppercase tracking-widest">
-              Exclusive Wholesale Distribution
-            </span>
-            <h2 className="text-4xl md:text-6xl font-serif font-bold leading-tight">
-              Sourcing Excellence for <span className="text-[#C7A67C]">General Stores & Drinks</span>
+        <section className="gateway-hero px-5 sm:px-8 py-14 sm:py-20">
+          <div className="max-w-4xl mx-auto relative z-10 text-center space-y-5">
+            <p className="inline-flex items-center gap-2 rounded-full border border-accent/35 bg-black/20 px-3.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">
+              Peshawar distribution network
+            </p>
+            <h2 className="font-serif font-bold text-3xl sm:text-5xl leading-[1.12] tracking-tight">
+              Wholesale commerce with multilingual AI for every storefront
             </h2>
-            <p className="text-base md:text-lg text-[#F6F0E8]/95 max-w-2xl mx-auto font-light leading-relaxed">
-              Connect directly with independent wholesalers, beverages distributors, and flour mills. Experience seamless multi-agent AI ordering and rapid delivery dispatch.
+            <p className="text-sm sm:text-base text-canvas/90 max-w-2xl mx-auto leading-relaxed">
+              Order drinks and groceries from isolated wholesaler tenants, confirm checkout yourself, and track delivery through one polished operating system.
             </p>
           </div>
         </section>
 
-        <section className="max-w-6xl mx-auto px-6 py-16 -mt-10 relative z-20">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-            <div className="bg-white rounded-3xl p-8 shadow-2xl border border-[#C7A67C]/30 flex flex-col justify-between hover:-translate-y-1 transition duration-300">
-              <div className="space-y-4">
-                <div className="h-48 rounded-2xl overflow-hidden shadow-inner">
-                  <img src="https://images.unsplash.com/photo-1534723452862-4c874018d66d?auto=format&fit=crop&w=800&q=80" alt="General Store Drinks" className="w-full h-full object-cover hover:scale-105 transition duration-500" />
+        <section className="portal-main !max-w-6xl -mt-8 sm:-mt-10 relative z-20 pb-12">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 sm:gap-5">
+            <article className="gateway-card">
+              <div className="space-y-3">
+                <div className="h-36 rounded-xl overflow-hidden bg-canvas">
+                  <img src="https://images.unsplash.com/photo-1534723452862-4c874018d66d?auto=format&fit=crop&w=800&q=80" alt="Shopkeeper ordering drinks" className="w-full h-full object-cover" />
                 </div>
-                <div className="w-12 h-12 rounded-2xl bg-[#502A40] text-[#C7A67C] flex items-center justify-center font-serif text-xl shadow">
-                  <ShoppingCart className="w-6 h-6" />
+                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
+                  <ShoppingCart className="w-5 h-5" />
                 </div>
-                <h3 className="text-2xl font-serif font-bold text-[#502A40]">Client / Shopkeeper Portal</h3>
-                <p className="text-sm text-slate-600 leading-relaxed">
-                  Browse drinks, beverages, and grocery catalogs, chat with our multilingual AI assistant, and place multi-wholesaler orders.
-                </p>
+                <h3 className="text-xl font-serif font-bold text-brand">Shopkeeper</h3>
+                <p className="text-sm text-muted leading-relaxed">AI chat & voice, live catalog, cart, and explicit checkout confirmation.</p>
               </div>
-              <div className="pt-6 mt-6 border-t border-slate-100 flex items-center gap-3">
-                <button onClick={() => { setClientAuthMode('signin'); setNavState('client_auth'); }} className="flex-1 bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow">Sign In</button>
-                <button onClick={() => { setClientAuthMode('signup'); setNavState('client_auth'); }} className="flex-1 bg-[#C7A67C] hover:bg-[#b5926b] text-[#502A40] font-semibold py-3 rounded-xl font-serif text-sm transition shadow">Sign Up</button>
+              <div className="flex gap-2 pt-2 border-t border-line">
+                <button type="button" onClick={() => { setClientAuthMode('signin'); setNavState('client_auth'); }} className="btn btn-primary flex-1">Sign in</button>
+                <button type="button" onClick={() => { setClientAuthMode('signup'); setNavState('client_auth'); }} className="btn btn-accent flex-1">Sign up</button>
               </div>
-            </div>
+            </article>
 
-            <div className="bg-white rounded-3xl p-8 shadow-2xl border border-[#C7A67C]/30 flex flex-col justify-between hover:-translate-y-1 transition duration-300">
-              <div className="space-y-4">
-                <div className="h-48 rounded-2xl overflow-hidden shadow-inner">
-                  <img src="https://images.unsplash.com/photo-1588964895597-cfccd6e2dbf9?auto=format&fit=crop&w=800&q=80" alt="Wholesale Inventory" className="w-full h-full object-cover hover:scale-105 transition duration-500" />
+            <article className="gateway-card">
+              <div className="space-y-3">
+                <div className="h-36 rounded-xl overflow-hidden bg-canvas">
+                  <img src="https://images.unsplash.com/photo-1588964895597-cfccd6e2dbf9?auto=format&fit=crop&w=800&q=80" alt="Wholesale inventory" className="w-full h-full object-cover" />
                 </div>
-                <div className="w-12 h-12 rounded-2xl bg-[#502A40] text-[#C7A67C] flex items-center justify-center font-serif text-xl shadow">
-                  <Package className="w-6 h-6" />
+                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
+                  <Package className="w-5 h-5" />
                 </div>
-                <h3 className="text-2xl font-serif font-bold text-[#502A40]">Wholesaler Tenant Portal</h3>
-                <p className="text-sm text-slate-600 leading-relaxed">
-                  Manage your private catalog, stock inventory, revenues, COGS, and approve/reject incoming suborders.
-                </p>
+                <h3 className="text-xl font-serif font-bold text-brand">Wholesaler</h3>
+                <p className="text-sm text-muted leading-relaxed">Tenant catalog, stock, profit KPIs, and suborder approve/reject.</p>
               </div>
-              <div className="pt-6 mt-6 border-t border-slate-100">
-                <button onClick={() => setNavState('wholesaler_auth')} className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow flex items-center justify-center gap-2">
-                  Sign In <ArrowRight className="w-4 h-4 text-[#C7A67C]" />
-                </button>
-              </div>
-            </div>
+              <button type="button" onClick={() => setNavState('wholesaler_auth')} className="btn btn-primary w-full">
+                Sign in <ArrowRight className="w-4 h-4 text-accent" />
+              </button>
+            </article>
 
-            <div className="bg-white rounded-3xl p-8 shadow-2xl border border-[#C7A67C]/30 flex flex-col justify-between hover:-translate-y-1 transition duration-300">
-              <div className="space-y-4">
-                <div className="h-48 rounded-2xl overflow-hidden shadow-inner">
-                  <img src="https://images.unsplash.com/photo-1586528116311-ad8dd3c8310d?auto=format&fit=crop&w=800&q=80" alt="Logistics & Dispatch" className="w-full h-full object-cover hover:scale-105 transition duration-500" />
+            <article className="gateway-card">
+              <div className="space-y-3">
+                <div className="h-36 rounded-xl overflow-hidden bg-canvas">
+                  <img src="https://images.unsplash.com/photo-1586528116311-ad8dd3c8310d?auto=format&fit=crop&w=800&q=80" alt="Operations hub" className="w-full h-full object-cover" />
                 </div>
-                <div className="w-12 h-12 rounded-2xl bg-[#502A40] text-[#C7A67C] flex items-center justify-center font-serif text-xl shadow">
-                  <ShieldCheck className="w-6 h-6" />
+                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
+                  <ShieldCheck className="w-5 h-5" />
                 </div>
-                <h3 className="text-2xl font-serif font-bold text-[#502A40]">Super Admin Portal</h3>
-                <p className="text-sm text-slate-600 leading-relaxed">
-                  Oversee tenant onboarding & suspension, global order dispatch queues, delivery assignments, and immutable audit logs.
-                </p>
+                <h3 className="text-xl font-serif font-bold text-brand">Admin</h3>
+                <p className="text-sm text-muted leading-relaxed">Tenants, dispatch queue, payments, and immutable audit trail.</p>
               </div>
-              <div className="pt-6 mt-6 border-t border-slate-100">
-                <button onClick={() => setNavState('admin_auth')} className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow flex items-center justify-center gap-2">
-                  Sign In <ArrowRight className="w-4 h-4 text-[#C7A67C]" />
-                </button>
+              <button type="button" onClick={() => setNavState('admin_auth')} className="btn btn-primary w-full">
+                Sign in <ArrowRight className="w-4 h-4 text-accent" />
+              </button>
+            </article>
+
+            <article className="gateway-card">
+              <div className="space-y-3">
+                <div className="h-36 rounded-xl overflow-hidden bg-canvas grid place-items-center">
+                  <Truck className="w-14 h-14 text-accent" />
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
+                  <Truck className="w-5 h-5" />
+                </div>
+                <h3 className="text-xl font-serif font-bold text-brand">Delivery</h3>
+                <p className="text-sm text-muted leading-relaxed">Mobile-first run sheet with clear dispatch → deliver actions.</p>
               </div>
-            </div>
+              <button type="button" onClick={() => setNavState('delivery_auth')} className="btn btn-primary w-full">
+                Sign in <ArrowRight className="w-4 h-4 text-accent" />
+              </button>
+            </article>
           </div>
         </section>
 
-        <footer className="mt-auto bg-[#502A40] text-[#F6F0E8] py-8 px-6 text-center text-xs font-serif border-t border-[#C7A67C]/20">
-          <p>© 2026 Peshawar General Store & Drinks Wholesale Platform. Elegant Premium Theme Edition.</p>
+        <footer className="mt-auto bg-brand-deep text-canvas/85 py-6 px-6 text-center text-xs border-t border-accent/20">
+          <p className="font-serif">© 2026 Peshawar General Store & Drinks Wholesale</p>
         </footer>
       </div>
     );
@@ -542,119 +1385,193 @@ export default function App() {
   // ================= 2. CLIENT AUTH =================
   if (navState === 'client_auth') {
     return (
-      <div className="min-h-screen bg-[#F6F0E8] flex items-center justify-center p-4 font-sans">
-        <div className="max-w-md w-full bg-white rounded-3xl p-8 shadow-2xl border border-[#C7A67C]/30 space-y-6">
-          <button onClick={() => setNavState('gateway')} className="flex items-center gap-2 text-xs font-serif text-[#502A40] hover:text-[#C7A67C] transition">
-            <ArrowLeft className="w-4 h-4" /> Back to Gateway
-          </button>
-          <div className="text-center space-y-2">
-            <div className="w-12 h-12 rounded-2xl bg-[#502A40] text-[#C7A67C] mx-auto flex items-center justify-center shadow">
-              <Store className="w-6 h-6" />
-            </div>
-            <h2 className="text-2xl font-serif font-bold text-[#502A40]">
-              {clientAuthMode === 'signin' ? 'Client Sign In' : 'Client Registration'}
-            </h2>
-            <p className="text-xs text-slate-500">
-              {clientAuthMode === 'signin' ? 'Enter your phone number to access your store orders.' : 'Enter your exact Name, Store Name, and Phone Number.'}
-            </p>
-          </div>
-          {authError && <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-xs font-medium">{authError}</div>}
-          {clientAuthMode === 'signup' ? (
-            <form onSubmit={handleClientSignup} className="space-y-4">
-              <div>
-                <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Your Full Name</label>
-                <input type="text" required value={clientSignupForm.name} onChange={e => setClientSignupForm({ ...clientSignupForm, name: e.target.value })} placeholder="e.g. Babar Khan" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-              </div>
-              <div>
-                <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Store Name</label>
-                <input type="text" required value={clientSignupForm.storeName} onChange={e => setClientSignupForm({ ...clientSignupForm, storeName: e.target.value })} placeholder="e.g. Babar General Store" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-              </div>
-              <div>
-                <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Phone Number</label>
-                <input type="text" required value={clientSignupForm.phone} onChange={e => setClientSignupForm({ ...clientSignupForm, phone: e.target.value })} placeholder="e.g. 03009876543" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-              </div>
-              <button type="submit" className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow-lg">Complete Sign Up</button>
-            </form>
-          ) : (
-            <form onSubmit={handleClientSignin} className="space-y-4">
-              <div>
-                <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Phone Number</label>
-                <input type="text" required value={clientSigninPhone} onChange={e => setClientSigninPhone(e.target.value)} placeholder="e.g. 03009876543" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-              </div>
-              <button type="submit" className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow-lg">Sign In to Portal</button>
-            </form>
-          )}
-          <div className="text-center pt-2">
-            <button onClick={() => { setClientAuthMode(clientAuthMode === 'signin' ? 'signup' : 'signin'); setAuthError(''); }} className="text-xs text-[#C7A67C] hover:underline font-serif">
-              {clientAuthMode === 'signin' ? "Don't have an account? Sign Up" : "Already have an account? Sign In"}
+      <AuthLayout
+        icon={Store}
+        title={clientAuthMode === 'signin' ? 'Shopkeeper sign in' : 'Register your store'}
+        subtitle={clientAuthMode === 'signin' ? 'Use your registered phone to open the ordering portal.' : 'Provide your name, store name, and phone number.'}
+        error={authError}
+        onBack={() => setNavState('gateway')}
+        footer={
+          <div className="space-y-3 text-center">
+            <p className="text-[11px] text-muted">Demo phone: 03009876543 · Babar General Store</p>
+            <button type="button" onClick={() => { setClientAuthMode(clientAuthMode === 'signin' ? 'signup' : 'signin'); setAuthError(''); }} className="text-xs font-semibold text-accent hover:underline">
+              {clientAuthMode === 'signin' ? "Don't have an account? Sign up" : 'Already registered? Sign in'}
             </button>
           </div>
-        </div>
-      </div>
+        }
+      >
+        {clientAuthMode === 'signup' ? (
+          <form onSubmit={handleClientSignup} className="space-y-3.5">
+            <div>
+              <label className="field-label">Full name</label>
+              <input type="text" required value={clientSignupForm.name} onChange={e => setClientSignupForm({ ...clientSignupForm, name: e.target.value })} placeholder="e.g. Babar Khan" className="field" />
+            </div>
+            <div>
+              <label className="field-label">Store name</label>
+              <input type="text" required value={clientSignupForm.storeName} onChange={e => setClientSignupForm({ ...clientSignupForm, storeName: e.target.value })} placeholder="e.g. Babar General Store" className="field" />
+            </div>
+            <div>
+              <label className="field-label">Phone number</label>
+              <input type="text" required value={clientSignupForm.phone} onChange={e => setClientSignupForm({ ...clientSignupForm, phone: e.target.value })} placeholder="e.g. 03009876543" className="field" />
+            </div>
+            <button type="submit" className="btn btn-primary btn-lg w-full">Create account</button>
+          </form>
+        ) : (
+          <form onSubmit={handleClientSignin} className="space-y-3.5">
+            <div>
+              <label className="field-label">Phone number</label>
+              <input type="text" required value={clientSigninPhone} onChange={e => setClientSigninPhone(e.target.value)} placeholder="e.g. 03009876543" className="field" />
+            </div>
+            <button type="submit" className="btn btn-primary btn-lg w-full">Enter shopkeeper portal</button>
+          </form>
+        )}
+      </AuthLayout>
     );
   }
 
   // ================= 3. WHOLESALER AUTH =================
   if (navState === 'wholesaler_auth') {
     return (
-      <div className="min-h-screen bg-[#F6F0E8] flex items-center justify-center p-4 font-sans">
-        <div className="max-w-md w-full bg-white rounded-3xl p-8 shadow-2xl border border-[#C7A67C]/30 space-y-6">
-          <button onClick={() => setNavState('gateway')} className="flex items-center gap-2 text-xs font-serif text-[#502A40] hover:text-[#C7A67C] transition">
-            <ArrowLeft className="w-4 h-4" /> Back to Gateway
-          </button>
-          <div className="text-center space-y-2">
-            <div className="w-12 h-12 rounded-2xl bg-[#502A40] text-[#C7A67C] mx-auto flex items-center justify-center shadow">
-              <Package className="w-6 h-6" />
-            </div>
-            <h2 className="text-2xl font-serif font-bold text-[#502A40]">Wholesaler Sign In</h2>
-            <p className="text-xs text-slate-500">Enter your registered tenant email and exact password.</p>
+      <AuthLayout
+        icon={Package}
+        title="Wholesaler sign in"
+        subtitle="Tenant email and password for your isolated catalog."
+        error={authError}
+        onBack={() => setNavState('gateway')}
+        footer={<p className="text-[11px] text-muted text-center">Demo: wholesaler1@market.pk / password123</p>}
+      >
+        <form onSubmit={handleWholesalerSignin} className="space-y-3.5">
+          <div>
+            <label className="field-label">Email</label>
+            <input type="email" required value={wholesalerEmail} onChange={e => setWholesalerEmail(e.target.value)} className="field" />
           </div>
-          {authError && <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-xs font-medium">{authError}</div>}
-          <form onSubmit={handleWholesalerSignin} className="space-y-4">
-            <div>
-              <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Wholesaler Email</label>
-              <input type="email" required value={wholesalerEmail} onChange={e => setWholesalerEmail(e.target.value)} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-            </div>
-            <div>
-              <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Password</label>
-              <input type="password" required value={wholesalerPassword} onChange={e => setWholesalerPassword(e.target.value)} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-            </div>
-            <button type="submit" className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow-lg">Sign In to Tenant Portal</button>
-          </form>
-          <div className="text-xs text-slate-400 text-center">Demo credentials: wholesaler1@market.pk / password123</div>
-        </div>
-      </div>
+          <div>
+            <label className="field-label">Password</label>
+            <input type="password" required value={wholesalerPassword} onChange={e => setWholesalerPassword(e.target.value)} className="field" />
+          </div>
+          <button type="submit" className="btn btn-primary btn-lg w-full">Enter tenant portal</button>
+        </form>
+      </AuthLayout>
     );
   }
 
   // ================= 4. ADMIN AUTH =================
   if (navState === 'admin_auth') {
     return (
-      <div className="min-h-screen bg-[#F6F0E8] flex items-center justify-center p-4 font-sans">
-        <div className="max-w-md w-full bg-white rounded-3xl p-8 shadow-2xl border border-[#C7A67C]/30 space-y-6">
-          <button onClick={() => setNavState('gateway')} className="flex items-center gap-2 text-xs font-serif text-[#502A40] hover:text-[#C7A67C] transition">
-            <ArrowLeft className="w-4 h-4" /> Back to Gateway
-          </button>
-          <div className="text-center space-y-2">
-            <div className="w-12 h-12 rounded-2xl bg-[#502A40] text-[#C7A67C] mx-auto flex items-center justify-center shadow">
-              <ShieldCheck className="w-6 h-6" />
-            </div>
-            <h2 className="text-2xl font-serif font-bold text-[#502A40]">Super Admin Sign In</h2>
-            <p className="text-xs text-slate-500">Enter exact administrator credentials.</p>
+      <AuthLayout
+        icon={ShieldCheck}
+        title="Admin sign in"
+        subtitle="Platform governance credentials."
+        error={authError}
+        onBack={() => setNavState('gateway')}
+        footer={<p className="text-[11px] text-muted text-center">Demo: admin@market.pk / admin123</p>}
+      >
+        <form onSubmit={handleAdminSignin} className="space-y-3.5">
+          <div>
+            <label className="field-label">Admin email</label>
+            <input type="email" required value={adminEmail} onChange={e => setAdminEmail(e.target.value)} className="field" />
           </div>
-          {authError && <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-xs font-medium">{authError}</div>}
-          <form onSubmit={handleAdminSignin} className="space-y-4">
-            <div>
-              <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Admin Email</label>
-              <input type="email" required value={adminEmail} onChange={e => setAdminEmail(e.target.value)} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
+          <div>
+            <label className="field-label">Password</label>
+            <input type="password" required value={adminPassword} onChange={e => setAdminPassword(e.target.value)} className="field" />
+          </div>
+          <button type="submit" className="btn btn-primary btn-lg w-full">Enter control hub</button>
+        </form>
+      </AuthLayout>
+    );
+  }
+
+  // ================= 4b. DELIVERY AUTH =================
+  if (navState === 'delivery_auth') {
+    return (
+      <AuthLayout
+        icon={Truck}
+        title="Delivery sign in"
+        subtitle="Assigned courier credentials only."
+        error={authError}
+        onBack={() => setNavState('gateway')}
+        footer={<p className="text-[11px] text-muted text-center">Demo: delivery@market.pk / delivery123</p>}
+      >
+        <form onSubmit={handleDeliverySignin} className="space-y-3.5">
+          <div>
+            <label className="field-label">Delivery email</label>
+            <input type="email" required value={deliveryEmail} onChange={e => setDeliveryEmail(e.target.value)} className="field" />
+          </div>
+          <div>
+            <label className="field-label">Password</label>
+            <input type="password" required value={deliveryPassword} onChange={e => setDeliveryPassword(e.target.value)} className="field" />
+          </div>
+          <button type="submit" className="btn btn-primary btn-lg w-full">Open delivery runs</button>
+        </form>
+      </AuthLayout>
+    );
+  }
+
+  // ================= 4c. DELIVERY PORTAL =================
+  if (navState === 'delivery_portal') {
+    const nextAction = (status: string) => {
+      if (status === 'Assigned') return { status: 'Dispatched', label: 'Mark dispatched' };
+      if (status === 'Dispatched') return { status: 'InTransit', label: 'Mark in transit' };
+      if (status === 'InTransit') return { status: 'Delivered', label: 'Confirm delivered' };
+      return null;
+    };
+    return (
+      <div className="app-shell">
+        <PortalHeader
+          icon={Truck}
+          title={`${currentDelivery?.name || 'Courier'} · Assigned runs`}
+          subtitle="Mobile delivery workspace"
+          onLogout={handleLogout}
+        />
+        <div className="portal-main !max-w-3xl space-y-3">
+          <AlertBanner>{actionError}</AlertBanner>
+          {shipments.length === 0 && (
+            <div className="surface-card">
+              <EmptyState icon={Truck} title="No assigned deliveries" description="When dispatch assigns a run, it will appear here with large action buttons." />
             </div>
-            <div>
-              <label className="text-xs font-serif font-semibold text-[#502A40] block mb-1">Password</label>
-              <input type="password" required value={adminPassword} onChange={e => setAdminPassword(e.target.value)} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-            </div>
-            <button type="submit" className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow-lg">Sign In as Super Admin</button>
-          </form>
-          <div className="text-xs text-slate-400 text-center">Demo credentials: admin@market.pk / admin123</div>
+          )}
+          {shipments.map((shp) => {
+            const action = nextAction(shp.status);
+            return (
+              <article key={shp.id} className="surface-card p-4 sm:p-5 space-y-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-serif font-bold text-brand text-base">{shp.id}</span>
+                      <StatusBadge status={shp.status} />
+                    </div>
+                    <p className="text-sm font-semibold text-brand">{shp.clientName || 'Shopkeeper'}</p>
+                    <p className="text-xs text-muted flex items-start gap-1.5">
+                      <MapPin className="w-3.5 h-3.5 mt-0.5 shrink-0 text-accent" />
+                      <span>{shp.deliveryAddress || 'Address on order'}</span>
+                    </p>
+                    <p className="text-[11px] text-muted">Order {shp.orderId}</p>
+                    {shp.failureReason && <p className="text-xs text-danger">Failure: {shp.failureReason}</p>}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {action && (
+                    <button
+                      type="button"
+                      onClick={() => updateShipmentStatus(shp.id, action.status, action.status === 'Delivered' ? { proofNotes: 'Delivered to storefront' } : {})}
+                      className="btn btn-primary delivery-action w-full"
+                    >
+                      <CheckCircle2 className="w-4 h-4" /> {action.label}
+                    </button>
+                  )}
+                  {shp.status === 'InTransit' && (
+                    <button
+                      type="button"
+                      onClick={() => updateShipmentStatus(shp.id, 'Failed', { failureReason: 'Customer unavailable' })}
+                      className="btn btn-danger delivery-action w-full"
+                    >
+                      <XCircle className="w-4 h-4" /> Mark failed
+                    </button>
+                  )}
+                </div>
+              </article>
+            );
+          })}
         </div>
       </div>
     );
@@ -663,203 +1580,428 @@ export default function App() {
   // ================= 5. CLIENT PORTAL =================
   if (navState === 'client_portal') {
     return (
-      <div className="min-h-screen bg-[#F6F0E8] text-[#502A40] flex flex-col font-sans">
-        <header className="bg-[#502A40] text-[#F6F0E8] px-6 py-4 shadow-md sticky top-0 z-40 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 rounded-xl bg-[#C7A67C] flex items-center justify-center text-[#502A40] font-bold">
-              <Store className="w-5 h-5" />
-            </div>
-            <div>
-              <h1 className="font-serif font-bold text-base">{currentClient?.storeName || 'Babar General Store'}</h1>
-              <p className="text-xs text-[#C7A67C]">Client Portal • {currentClient?.name}</p>
-            </div>
-          </div>
-          <div className="flex items-center space-x-4">
-            <button onClick={() => setCheckoutModal(true)} className="relative bg-[#C7A67C]/20 border border-[#C7A67C]/40 text-[#F6F0E8] hover:bg-[#C7A67C]/30 px-4 py-2 rounded-xl flex items-center gap-2 text-xs font-serif transition">
-              <ShoppingCart className="w-4 h-4 text-[#C7A67C]" /> Cart ({totalCartItemsCount})
-              {totalCartItemsCount > 0 && <span className="absolute -top-1.5 -right-1.5 bg-[#C7A67C] text-[#502A40] font-bold text-[10px] w-5 h-5 rounded-full flex items-center justify-center">{totalCartItemsCount}</span>}
-            </button>
-            <button onClick={() => setNavState('gateway')} className="bg-white/10 hover:bg-white/20 text-[#F6F0E8] px-3 py-2 rounded-xl text-xs font-serif flex items-center gap-1.5 transition">
-              <LogOut className="w-3.5 h-3.5" /> Logout
-            </button>
-          </div>
-        </header>
+      <div className="app-shell">
+        <PortalHeader
+          icon={Store}
+          title={currentClient?.storeName || 'Babar General Store'}
+          subtitle={`Shopkeeper · ${currentClient?.name || 'Account'}`}
+          onLogout={handleLogout}
+        >
+          <button type="button" onClick={() => setCheckoutModal(true)} className="btn btn-ghost btn-sm relative">
+            <ShoppingCart className="w-4 h-4 text-accent" />
+            <span className="hidden xs:inline sm:inline">Cart</span>
+            <span className="font-bold">{totalCartItemsCount}</span>
+            {totalCartItemsCount > 0 && (
+              <span className="absolute -top-1 -right-1 bg-accent text-brand font-bold text-[10px] min-w-4 h-4 px-1 rounded-full grid place-items-center">
+                {totalCartItemsCount}
+              </span>
+            )}
+          </button>
+        </PortalHeader>
 
-        <div className="max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
-          <div className="flex space-x-2 bg-white p-2 rounded-2xl border border-[#C7A67C]/30 shadow-sm">
-            <button onClick={() => setClientTab('chat')} className={`px-4 py-2 rounded-xl text-xs font-serif transition flex items-center gap-2 ${clientTab === 'chat' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}><MessageSquare className="w-4 h-4 text-[#C7A67C]" /> AI Assistant & Drinks Chat</button>
-            <button onClick={() => setClientTab('catalog')} className={`px-4 py-2 rounded-xl text-xs font-serif transition flex items-center gap-2 ${clientTab === 'catalog' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}><Package className="w-4 h-4 text-[#C7A67C]" /> General Store & Drinks Catalog</button>
-            <button onClick={() => setClientTab('orders')} className={`px-4 py-2 rounded-xl text-xs font-serif transition flex items-center gap-2 ${clientTab === 'orders' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}><Clock className="w-4 h-4 text-[#C7A67C]" /> Orders Timeline</button>
-            <button onClick={() => setClientTab('invoices')} className={`px-4 py-2 rounded-xl text-xs font-serif transition flex items-center gap-2 ${clientTab === 'invoices' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}><FileText className="w-4 h-4 text-[#C7A67C]" /> Invoices & Balances</button>
-          </div>
+        <div className="portal-main">
+          <TabRail
+            value={clientTab}
+            onChange={(id) => setClientTab(id as typeof clientTab)}
+            tabs={[
+              { id: 'chat', label: 'AI assistant', icon: MessageSquare },
+              { id: 'catalog', label: 'Catalog', icon: Package },
+              { id: 'orders', label: 'Orders', icon: Clock },
+              { id: 'invoices', label: 'Invoices', icon: FileText },
+            ]}
+          />
 
           {clientTab === 'chat' && (
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              <div className="lg:col-span-2 bg-white rounded-3xl border border-[#C7A67C]/30 flex flex-col h-[600px] shadow-xl overflow-hidden">
-                <div className="p-4 bg-[#502A40] text-[#F6F0E8] flex items-center justify-between">
-                  <div className="flex items-center space-x-3">
-                    <div className="w-9 h-9 rounded-full bg-[#C7A67C] flex items-center justify-center text-[#502A40] font-bold text-xs">AI</div>
-                    <div>
-                      <h3 className="font-serif font-bold text-sm">Peshawar Wholesale Assistant</h3>
-                      <p className="text-[10px] text-[#C7A67C]">Multilingual Drinks & Groceries AI</p>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-5">
+              <div className="lg:col-span-2 surface-card chat-shell">
+                <div className="px-3 sm:px-4 py-3 bg-brand text-canvas flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-9 h-9 rounded-full bg-accent text-brand grid place-items-center font-bold text-xs shrink-0">AI</div>
+                    <div className="min-w-0">
+                      <h3 className="font-serif font-bold text-sm truncate">Peshawar Wholesale Assistant</h3>
+                      <p className="text-[10px] text-accent">WhatsApp-style voice · EN / اردو / پښتو</p>
                     </div>
                   </div>
-                  <div className="flex space-x-1 bg-black/20 p-1 rounded-xl">
-                    <button onClick={() => setChatLanguage('ur')} className={`px-2.5 py-1 rounded-lg text-xs font-serif ${chatLanguage === 'ur' ? 'bg-[#C7A67C] text-[#502A40]' : 'text-white'}`}>اردو</button>
-                    <button onClick={() => setChatLanguage('ps')} className={`px-2.5 py-1 rounded-lg text-xs font-serif ${chatLanguage === 'ps' ? 'bg-[#C7A67C] text-[#502A40]' : 'text-white'}`}>پښتو</button>
-                    <button onClick={() => setChatLanguage('en')} className={`px-2.5 py-1 rounded-lg text-xs font-serif ${chatLanguage === 'en' ? 'bg-[#C7A67C] text-[#502A40]' : 'text-white'}`}>ENG</button>
+                  <div className="flex items-center gap-2">
+                    <label className="hidden sm:flex items-center gap-1.5 text-[10px] text-accent cursor-pointer" title="Review/edit transcript before sending">
+                      <input type="checkbox" checked={voiceReviewMode} onChange={(e) => setVoiceReviewMode(e.target.checked)} className="rounded border-accent" />
+                      Review
+                    </label>
+                    <div className="flex bg-black/20 p-0.5 rounded-lg" role="group" aria-label="Chat language">
+                      {([
+                        ['ur', 'اردو'],
+                        ['ps', 'پښتو'],
+                        ['en', 'EN'],
+                      ] as const).map(([code, label]) => (
+                        <button
+                          key={code}
+                          type="button"
+                          onClick={() => setChatLanguage(code)}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition ${chatLanguage === code ? 'bg-accent text-brand' : 'text-canvas/80 hover:text-white'}`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
-                <div ref={chatScrollRef} className="flex-1 p-4 overflow-y-auto space-y-4 bg-[#F6F0E8]/40">
+                <div ref={chatScrollRef} className="flex-1 p-3 sm:p-4 overflow-y-auto space-y-3 bg-canvas/50">
                   {chatHistory.map((msg, idx) => (
                     <div key={idx} className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
-                      <div className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed shadow-sm ${msg.sender === 'user' ? 'bg-[#502A40] text-white rounded-br-sm' : 'bg-white text-[#502A40] rounded-bl-sm border border-[#C7A67C]/30'}`}>
+                      <div className={`max-w-[92%] sm:max-w-[85%] p-3.5 text-sm leading-relaxed ${msg.sender === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'}`}>
                         <p className="whitespace-pre-wrap">{msg.text}</p>
                         {msg.products && msg.products.length > 0 && (
-                          <div className="mt-3 pt-3 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                            {msg.products.map(p => (
-                              <div key={p.id} className="bg-[#F6F0E8] p-2.5 rounded-xl border border-[#C7A67C]/30 flex flex-col justify-between">
-                                <div>
-                                  <h4 className="font-serif font-bold text-xs text-[#502A40]">{p.name}</h4>
-                                  <p className="text-xs text-slate-600 font-semibold mt-1">PKR {p.sellingPrice.toLocaleString()} / {p.unit}</p>
+                          <div className="mt-3 pt-3 border-t border-black/5 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {msg.products.map((p) => {
+                              const avail = p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved);
+                              return (
+                                <div key={p.id} className="bg-canvas/80 p-2.5 rounded-xl border border-line flex flex-col gap-2">
+                                  <div>
+                                    <h4 className="font-serif font-bold text-xs text-brand">{p.name}</h4>
+                                    <p className="text-[10px] text-muted mt-0.5">MOQ {p.moq} · {p.unit}</p>
+                                    <p className="text-xs font-semibold text-brand mt-1">PKR {p.sellingPrice.toLocaleString()}</p>
+                                    <div className="mt-2">
+                                      <StockMeter available={avail} capacity={Math.max(p.stockOnHand, avail, 1)} />
+                                    </div>
+                                  </div>
+                                  <button type="button" disabled={cartBusy} onClick={() => addToCart(p.id, Math.max(p.moq, 1))} className="btn btn-primary btn-sm w-full">Add to cart</button>
                                 </div>
-                                <button onClick={() => { addToCart(p.id, p.moq); alert(`Added ${p.name} to cart!`); }} className="mt-2 bg-[#502A40] hover:bg-[#683753] text-white text-xs py-1.5 rounded-lg font-serif transition">Add to Cart</button>
-                              </div>
-                            ))}
+                              );
+                            })}
                           </div>
                         )}
+                        {msg.cartPreview && (
+                          <div className="mt-3 pt-3 border-t border-line space-y-1">
+                            <p className="text-[10px] font-bold uppercase tracking-wide text-accent">Cart preview</p>
+                            {msg.cartPreview.lines.map((line, i) => (
+                              <p key={i} className="text-xs text-muted">{line.quantity} × {line.name} — PKR {line.lineTotal.toLocaleString()}</p>
+                            ))}
+                            <p className="text-xs font-semibold text-brand">Subtotal PKR {msg.cartPreview.subtotal.toLocaleString()}</p>
+                          </div>
+                        )}
+                        {msg.needsConfirmation && (
+                          <div className="mt-3 flex flex-wrap items-center gap-2">
+                            <button type="button" onClick={() => setCheckoutModal(true)} className="btn btn-accent btn-sm">Review & confirm checkout</button>
+                            <span className="text-[10px] text-warning">Not placed until you confirm.</span>
+                          </div>
+                        )}
+                        {msg.sender === 'ai' && (
+                          <div className="mt-3 flex flex-wrap items-center gap-2">
+                            <button type="button" onClick={() => playAssistantTts(msg, idx)} className="btn btn-secondary btn-sm">
+                              {playingMsgIdx === idx ? <Pause className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                              {playingMsgIdx === idx ? 'Pause' : 'Play'}
+                            </button>
+                            {msg.ttsNote && <span className="text-[10px] text-warning leading-snug">{msg.ttsNote}</span>}
+                          </div>
+                        )}
+                        {msg.error && msg.retryText && (
+                          <button type="button" onClick={() => handleSendMessage(msg.retryText)} className="mt-3 text-xs underline text-brand font-semibold">Retry message</button>
+                        )}
                       </div>
-                      <span className="text-[10px] text-slate-400 mt-1 px-1">{msg.timestamp}</span>
+                      <span className="text-[10px] text-muted/80 mt-1 px-1">{msg.timestamp}</span>
                     </div>
                   ))}
-                  {isAiLoading && <p className="text-xs text-slate-500 italic">AI assistant is checking stock...</p>}
+                  {isAiLoading && (
+                    <div className="flex items-start">
+                      <div className="chat-bubble-ai px-4 py-3 flex items-center gap-2">
+                        <span className="typing-dot" />
+                        <span className="typing-dot" />
+                        <span className="typing-dot" />
+                        <span className="text-xs text-muted ml-1">{voiceBusyNote || 'Checking live stock & cart…'}</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
-                <div className="p-3 bg-white border-t border-[#C7A67C]/30 flex items-center gap-2">
-                  <input type="text" value={chatInput} onChange={e => setChatInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSendMessage()} placeholder="Ask for drinks, beverages, flour, or grocery stocks..." className="flex-1 bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl px-4 py-2.5 text-sm text-[#502A40] focus:outline-none focus:border-[#502A40]" />
-                  <button onClick={handleSendMessage} className="bg-[#502A40] hover:bg-[#683753] text-white p-2.5 rounded-xl transition shadow"><Send className="w-4 h-4" /></button>
-                </div>
-              </div>
+                <div className="p-3 bg-surface border-t border-line space-y-2">
+                  {chatError && <AlertBanner>{chatError}</AlertBanner>}
+                  {voiceError && <AlertBanner>{voiceError}</AlertBanner>}
 
-              <div className="space-y-4">
-                <div className="bg-white rounded-3xl p-6 border border-[#C7A67C]/30 shadow-xl space-y-4">
-                  <h4 className="font-serif font-bold text-[#502A40] text-base flex items-center gap-2"><Sparkles className="w-4 h-4 text-[#C7A67C]" /> Drinks & Store Quick Prompts</h4>
-                  <div className="space-y-2">
-                    <button onClick={() => { setChatInput('Show available drinks and cold beverages'); handleSendMessage(); }} className="w-full text-left p-3 rounded-xl bg-[#F6F0E8]/60 hover:bg-[#F6F0E8] border border-[#C7A67C]/30 text-xs text-[#502A40] font-serif transition">"Show available drinks and cold beverages"</button>
-                    <button onClick={() => { setChatInput('5 bags of super fine wheat flour'); handleSendMessage(); }} className="w-full text-left p-3 rounded-xl bg-[#F6F0E8]/60 hover:bg-[#F6F0E8] border border-[#C7A67C]/30 text-xs text-[#502A40] font-serif transition">"5 bags of super fine wheat flour"</button>
+                  {voiceState === 'recording' && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-red-50 border border-red-200 px-3 py-2.5">
+                      <div className="flex items-center gap-2 text-red-700 text-xs font-semibold">
+                        <span className="rec-pulse" />
+                        Recording… {formatDuration(recordingMs)} / 1:00
+                      </div>
+                      <div className="flex gap-2">
+                        <button type="button" onClick={stopVoiceRecording} className="btn btn-primary btn-sm"><Square className="w-3 h-3" /> Stop</button>
+                        <button type="button" onClick={cancelVoiceRecording} className="btn btn-danger btn-sm"><X className="w-3 h-3" /> Cancel</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {voiceState === 'preview' && previewUrl && (
+                    <div className="rounded-xl border border-line bg-canvas/70 p-3 space-y-2">
+                      <p className="text-[11px] text-brand font-semibold">Review mode — preview ({formatDuration(recordingMs)})</p>
+                      <audio ref={previewAudioRef} src={previewUrl} controls className="w-full h-9" />
+                      <div className="flex flex-wrap gap-2">
+                        <button type="button" onClick={uploadAndTranscribeForReview} className="btn btn-primary btn-sm">Transcribe to edit</button>
+                        <button type="button" onClick={() => { resetVoiceSession(); startVoiceRecording(); }} className="btn btn-secondary btn-sm">Re-record</button>
+                        <button type="button" onClick={() => resetVoiceSession()} className="btn btn-secondary btn-sm">Discard</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {(voiceState === 'transcribing' || voiceState === 'submitting') && (
+                    <p className="text-[11px] text-muted px-1 italic flex items-center gap-2">
+                      <RefreshCw className="w-3 h-3 animate-spin text-accent" />
+                      {voiceBusyNote || 'Processing voice…'}
+                    </p>
+                  )}
+
+                  {voiceState === 'review' && (
+                    <div className="rounded-xl border border-line bg-white p-3 space-y-2">
+                      <p className="text-[11px] text-brand font-semibold">
+                        {transcriptionSucceeded ? 'Edit transcript before sending' : 'Manual text fallback'}
+                      </p>
+                      {!transcriptionSucceeded && (
+                        <AlertBanner tone="warn">
+                          Transcription did not succeed. Type what you said — we never invent a transcript. Checkout still needs a separate confirm.
+                        </AlertBanner>
+                      )}
+                      {transcriptionSucceeded && (
+                        <p className="text-[10px] text-muted">Review mode is on. Edit if needed, then send.</p>
+                      )}
+                      <textarea
+                        value={transcriptDraft}
+                        onChange={(e) => setTranscriptDraft(e.target.value)}
+                        rows={3}
+                        className="field"
+                        placeholder="Type or edit what you said, e.g. Mujhe Pepsi ki 2 petiyan chahiye"
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <button type="button" disabled={!transcriptDraft.trim() || !transcriptId} onClick={submitReviewedVoice} className="btn btn-primary btn-sm">Send to assistant</button>
+                        <button type="button" onClick={() => { resetVoiceSession(); startVoiceRecording(); }} className="btn btn-secondary btn-sm">Re-record</button>
+                        <button type="button" onClick={() => resetVoiceSession()} className="btn btn-secondary btn-sm">Discard</button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      title={voiceSupported ? 'Record voice message' : 'Voice unsupported in this browser'}
+                      aria-label={voiceState === 'recording' ? 'Stop recording' : 'Start recording'}
+                      onClick={() => (voiceState === 'recording' ? stopVoiceRecording() : startVoiceRecording())}
+                      disabled={isAiLoading || voiceState === 'transcribing' || voiceState === 'submitting' || voiceState === 'review'}
+                      className={`btn btn-icon shrink-0 ${voiceState === 'recording' ? 'bg-red-600 text-white border-red-600' : 'btn-secondary'}`}
+                    >
+                      <Mic className="w-4 h-4" />
+                    </button>
+                    <input
+                      type="text"
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSendMessage()}
+                      placeholder="Message in English / اردو / پښتو…"
+                      className="field flex-1 !py-2.5"
+                      disabled={isAiLoading || voiceState === 'submitting'}
+                    />
+                    <button type="button" onClick={() => handleSendMessage()} disabled={isAiLoading || !chatInput.trim() || voiceState === 'submitting'} className="btn btn-primary btn-icon shrink-0" aria-label="Send message">
+                      <Send className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
               </div>
+
+              <aside className="space-y-4">
+                <div className="surface-card p-5 space-y-3">
+                  <h4 className="font-serif font-bold text-brand text-sm flex items-center gap-2"><Mic className="w-4 h-4 text-accent" /> Voice tips</h4>
+                  <ul className="text-[11px] text-muted space-y-1.5 leading-relaxed list-disc pl-4">
+                    <li>Mic → speak → Stop → auto transcript + reply.</li>
+                    <li>Enable Review to edit before send.</li>
+                    <li>On STT failure / 429, type manually — never fabricated.</li>
+                    <li>Checkout always needs your explicit confirm.</li>
+                  </ul>
+                  <label className="flex sm:hidden items-center gap-2 text-[11px] text-brand font-medium">
+                    <input type="checkbox" checked={voiceReviewMode} onChange={(e) => setVoiceReviewMode(e.target.checked)} />
+                    Review mode
+                  </label>
+                </div>
+                <div className="surface-card p-5 space-y-3">
+                  <h4 className="font-serif font-bold text-brand text-sm flex items-center gap-2"><Sparkles className="w-4 h-4 text-accent" /> Quick prompts</h4>
+                  <div className="space-y-2">
+                    {[
+                      'Show me available cold drinks.',
+                      'Mujhe Pepsi ki 5 petiyan chahiye.',
+                      'ما ته د پیپسي پنځه کارټنه پکار دي.',
+                      'Show my cart and propose checkout',
+                    ].map((prompt) => (
+                      <button
+                        key={prompt}
+                        type="button"
+                        disabled={isAiLoading}
+                        onClick={() => handleSendMessage(prompt)}
+                        className="w-full text-left p-3 rounded-xl bg-canvas/70 hover:bg-canvas border border-line text-xs text-brand font-medium transition disabled:opacity-60"
+                      >
+                        “{prompt}”
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </aside>
             </div>
           )}
 
           {clientTab === 'catalog' && (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {products.map(p => (
-                <div key={p.id} className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl flex flex-col justify-between">
-                  <div>
-                    <span className="text-[10px] bg-[#C7A67C]/20 text-[#502A40] px-2 py-0.5 rounded-full font-serif font-semibold">{p.sku}</span>
-                    <h3 className="font-serif font-bold text-[#502A40] text-lg mt-2 mb-1">{p.name}</h3>
-                    <p className="text-xs text-slate-500 mb-4">Pack: {p.packSize} | Stock: {p.stockOnHand} {p.unit}s</p>
-                  </div>
-                  <div className="flex items-center justify-between pt-4 border-t border-slate-100">
-                    <span className="text-base font-bold text-[#502A40]">PKR {p.sellingPrice.toLocaleString()}</span>
-                    <button onClick={() => { addToCart(p.id, p.moq); alert(`Added ${p.name} to cart!`); }} className="bg-[#502A40] hover:bg-[#683753] text-white px-4 py-2 rounded-xl text-xs font-serif transition shadow">Add to Cart</button>
-                  </div>
+            <div className="space-y-4">
+              <AlertBanner>{actionError}</AlertBanner>
+              {products.filter((p) => p.status !== 'inactive').length === 0 && (
+                <div className="surface-card">
+                  <EmptyState icon={Package} title="No products available" description="Ask the assistant or check back when wholesalers restock." />
                 </div>
-              ))}
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                {products.filter((p) => p.status !== 'inactive').map((p) => {
+                  const avail = p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved);
+                  return (
+                    <article key={p.id} className="surface-card p-5 flex flex-col justify-between gap-4">
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="status-pill status-neutral">{p.sku}</span>
+                          <StatusBadge status={p.status} />
+                        </div>
+                        <h3 className="font-serif font-bold text-brand text-lg leading-snug">{p.name}</h3>
+                        <p className="text-xs text-muted">Pack {p.packSize} · MOQ {p.moq} {p.unit}</p>
+                        <StockMeter available={avail} capacity={Math.max(p.stockOnHand, avail, 1)} />
+                      </div>
+                      <div className="flex items-center justify-between gap-3 pt-3 border-t border-line">
+                        <span className="text-base font-bold text-brand">PKR {p.sellingPrice.toLocaleString()}</span>
+                        <button type="button" disabled={cartBusy || avail <= 0} onClick={() => addToCart(p.id, p.moq)} className="btn btn-primary btn-sm">Add to cart</button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
             </div>
           )}
 
           {clientTab === 'orders' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">My Orders & Suborders Timeline</h3>
-              <div className="space-y-4">
-                {orders.map(ord => (
-                  <div key={ord.id} className="bg-[#F6F0E8]/50 p-5 rounded-2xl border border-[#C7A67C]/30 space-y-3">
-                    <div className="flex justify-between items-center pb-2 border-b border-[#C7A67C]/20">
-                      <div>
-                        <span className="font-serif font-bold text-[#502A40] text-base">{ord.id}</span>
-                        <span className="ml-3 text-xs bg-[#C7A67C]/20 text-[#502A40] px-2.5 py-0.5 rounded-full font-serif font-semibold">{ord.status}</span>
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <h3 className="font-serif font-bold text-brand text-lg">Orders timeline</h3>
+              {orders.length === 0 && <EmptyState icon={Clock} title="No orders yet" description="Confirm checkout from your cart to place the first wholesale order." />}
+              <div className="space-y-3">
+                {orders.map((ord) => (
+                  <article key={ord.id} className="rounded-2xl border border-line bg-canvas/50 p-4 sm:p-5 space-y-3">
+                    <div className="flex flex-wrap justify-between items-center gap-2 pb-2 border-b border-line">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-serif font-bold text-brand">{ord.id}</span>
+                        <StatusBadge status={ord.status} />
                       </div>
-                      <span className="font-serif font-bold text-[#502A40]">PKR {ord.totalAmount.toLocaleString()}</span>
+                      <span className="font-serif font-bold text-brand">PKR {ord.totalAmount.toLocaleString()}</span>
                     </div>
-                    <ul className="text-xs text-slate-600 space-y-1">
-                      {(ord.subOrders || []).flatMap(s => s.items || []).map((item, i) => (
+                    <ul className="text-xs text-muted space-y-1">
+                      {(ord.subOrders || []).flatMap((s) => s.items || []).map((item, i) => (
                         <li key={i}>• {item.name} × {item.quantity} {item.unit}</li>
                       ))}
                     </ul>
-                  </div>
+                  </article>
                 ))}
               </div>
             </div>
           )}
 
           {clientTab === 'invoices' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">Invoices & Account Balances</h3>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm text-slate-700">
-                  <thead className="bg-[#F6F0E8] text-[#502A40] font-serif text-xs uppercase">
-                    <tr><th className="p-3">Invoice ID</th><th className="p-3">Order ID</th><th className="p-3">Amount</th><th className="p-3">Paid</th><th className="p-3">Status</th></tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {invoices.map(inv => (
-                      <tr key={inv.id}>
-                        <td className="p-3 font-serif font-bold text-[#502A40]">{inv.id}</td>
-                        <td className="p-3">{inv.orderId}</td>
-                        <td className="p-3 font-semibold">PKR {inv.amount.toLocaleString()}</td>
-                        <td className="p-3 text-emerald-600">PKR {inv.paidAmount.toLocaleString()}</td>
-                        <td className="p-3"><span className="bg-[#C7A67C]/20 text-[#502A40] px-2 py-0.5 rounded text-xs font-serif">{inv.status}</span></td>
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <h3 className="font-serif font-bold text-brand text-lg">Invoices & balances</h3>
+              {invoices.length === 0 && <EmptyState icon={FileText} title="No invoices yet" description="Invoices appear after successful delivery." />}
+              {invoices.length > 0 && (
+                <div className="data-table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Invoice</th><th>Order</th><th>Amount</th><th>Paid</th><th>Outstanding</th><th>Status</th><th></th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {invoices.map((inv) => (
+                        <tr key={inv.id}>
+                          <td className="font-serif font-bold text-brand">{inv.invoiceNumber || inv.id}</td>
+                          <td>{inv.orderId}</td>
+                          <td className="font-semibold">PKR {Number(inv.amount).toLocaleString()}</td>
+                          <td className="text-success">PKR {Number(inv.paidAmount).toLocaleString()}</td>
+                          <td className="text-warning">PKR {Number(inv.outstandingAmount ?? (inv.amount - inv.paidAmount)).toLocaleString()}</td>
+                          <td><StatusBadge status={inv.status} /></td>
+                          <td>
+                            <button type="button" onClick={() => setSelectedInvoice(inv)} className="text-xs font-semibold text-brand hover:underline">View</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
         </div>
 
-        {checkoutModal && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-            <div className="bg-white border border-[#C7A67C]/40 rounded-3xl p-6 max-w-lg w-full space-y-6 shadow-2xl">
-              <div className="flex justify-between items-center">
-                <h3 className="font-serif font-bold text-[#502A40] text-xl">Confirm Wholesale Order</h3>
-                <button onClick={() => setCheckoutModal(false)} className="text-slate-400 hover:text-[#502A40]">✕</button>
-              </div>
-              <div className="space-y-3 max-h-60 overflow-y-auto">
-                {Object.keys(cart).map(productId => {
-                  const p = products.find(prod => prod.id === productId);
-                  if (!p) return null;
-                  return (
-                    <div key={productId} className="bg-[#F6F0E8]/50 p-3 rounded-2xl flex justify-between items-center">
-                      <div>
-                        <h4 className="font-serif font-bold text-[#502A40] text-sm">{p.name}</h4>
-                        <p className="text-xs text-slate-500">PKR {p.sellingPrice.toLocaleString()} / {p.unit}</p>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <button onClick={() => updateCartQty(productId, cart[productId] - 1)} className="px-2 py-0.5 bg-white rounded border border-[#C7A67C]/30">-</button>
-                        <span className="text-xs font-bold text-[#502A40]">{cart[productId]}</span>
-                        <button onClick={() => updateCartQty(productId, cart[productId] + 1)} className="px-2 py-0.5 bg-white rounded border border-[#C7A67C]/30">+</button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-              <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
-                <span className="font-serif text-slate-600">Total Consolidated:</span>
-                <span className="font-serif font-bold text-xl text-[#502A40]">
-                  PKR {Object.keys(cart).reduce((sum, id) => {
-                    const p = products.find(prod => prod.id === id);
-                    return sum + (p ? p.sellingPrice * cart[id] : 0);
-                  }, 0).toLocaleString()}
-                </span>
-              </div>
-              <button onClick={submitOrder} className="w-full bg-[#502A40] hover:bg-[#683753] text-white py-3 rounded-xl font-serif text-sm transition shadow-lg">Submit Order to Wholesaler(s)</button>
-            </div>
+        <ModalFrame open={checkoutModal} onClose={() => setCheckoutModal(false)} title="Confirm wholesale order">
+          <AlertBanner tone="warn">Orders are never placed silently. Review quantities and confirm below.</AlertBanner>
+          <div className="space-y-2.5 max-h-56 overflow-y-auto">
+            {Object.keys(cart).length === 0 && <p className="text-sm text-muted">Your cart is empty.</p>}
+            {Object.keys(cart).map((productId) => {
+              const p = products.find((prod) => prod.id === productId);
+              if (!p) return null;
+              return (
+                <div key={productId} className="bg-canvas/70 p-3 rounded-xl flex justify-between items-center gap-3">
+                  <div className="min-w-0">
+                    <h4 className="font-serif font-bold text-brand text-sm truncate">{p.name}</h4>
+                    <p className="text-xs text-muted">PKR {p.sellingPrice.toLocaleString()} / {p.unit}</p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button type="button" onClick={() => updateCartQty(productId, cart[productId] - 1)} className="btn btn-secondary btn-sm !px-2.5">−</button>
+                    <span className="text-xs font-bold text-brand w-6 text-center">{cart[productId]}</span>
+                    <button type="button" onClick={() => updateCartQty(productId, cart[productId] + 1)} className="btn btn-secondary btn-sm !px-2.5">+</button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
-        )}
+          <label className="block">
+            <span className="field-label">Delivery address</span>
+            <input value={deliveryAddress} onChange={(e) => setDeliveryAddress(e.target.value)} className="field" />
+          </label>
+          <div className="pt-2 border-t border-line flex justify-between items-center gap-3">
+            <span className="text-sm text-muted">Server preview total</span>
+            <span className="font-serif font-bold text-xl text-brand">
+              PKR {(cartSubtotal || Object.keys(cart).reduce((sum, id) => {
+                const p = products.find((prod) => prod.id === id);
+                return sum + (p ? p.sellingPrice * cart[id] : 0);
+              }, 0)).toLocaleString()}
+            </span>
+          </div>
+          <AlertBanner>{checkoutError}</AlertBanner>
+          <button type="button" disabled={orderBusy || cartBusy || totalCartItemsCount === 0} onClick={submitOrder} className="btn btn-primary btn-lg w-full">
+            {orderBusy ? 'Submitting…' : 'Confirm & submit to wholesaler(s)'}
+          </button>
+        </ModalFrame>
+
+        <ModalFrame open={Boolean(selectedInvoice)} onClose={() => setSelectedInvoice(null)} title={`Invoice ${selectedInvoice?.invoiceNumber || selectedInvoice?.id || ''}`} zClass="z-[60]">
+          {selectedInvoice && (
+            <>
+              <p className="text-xs text-muted">Order {selectedInvoice.orderId} · {selectedInvoice.clientName || 'Shopkeeper'}</p>
+              <p className="text-xs text-muted">Wholesaler: {selectedInvoice.wholesalerName || selectedInvoice.wholesalerId}</p>
+              <ul className="text-sm space-y-2 border-y border-line py-3">
+                {(selectedInvoice.lines || []).map((line) => (
+                  <li key={line.id} className="flex justify-between gap-3">
+                    <span>{line.name} × {line.quantity} {line.unit}</span>
+                    <span className="font-serif font-semibold">PKR {Number(line.lineTotal).toLocaleString()}</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="text-sm space-y-1">
+                <div className="flex justify-between"><span>Total</span><span className="font-serif font-bold">PKR {Number(selectedInvoice.amount).toLocaleString()}</span></div>
+                <div className="flex justify-between"><span>Paid</span><span>PKR {Number(selectedInvoice.paidAmount).toLocaleString()}</span></div>
+                <div className="flex justify-between"><span>Outstanding</span><span className="font-serif font-bold text-warning">PKR {Number(selectedInvoice.outstandingAmount ?? (selectedInvoice.amount - selectedInvoice.paidAmount)).toLocaleString()}</span></div>
+              </div>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => window.print()} className="btn btn-primary flex-1">Print</button>
+                <button type="button" onClick={() => setSelectedInvoice(null)} className="btn btn-secondary flex-1">Close</button>
+              </div>
+            </>
+          )}
+        </ModalFrame>
       </div>
     );
   }
@@ -874,6 +2016,8 @@ export default function App() {
     const myRevenue = approvedSubs.reduce((acc, s) => acc + (s.subtotal || 0), 0);
     const myCogs = approvedSubs.reduce((acc, s) => {
       return acc + (s.items || []).reduce((sum, item) => {
+        const snap = (item as any).costPrice;
+        if (typeof snap === 'number') return sum + snap * item.quantity;
         const prod = products.find(p => p.id === item.productId);
         return sum + ((prod ? prod.costPrice : 0) * item.quantity);
       }, 0);
@@ -881,99 +2025,107 @@ export default function App() {
     const myProfit = myRevenue - myCogs;
 
     return (
-      <div className="min-h-screen bg-[#F6F0E8] text-[#502A40] flex flex-col font-sans">
-        <header className="bg-[#502A40] text-[#F6F0E8] px-6 py-4 shadow-md sticky top-0 z-40 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 rounded-xl bg-[#C7A67C] flex items-center justify-center text-[#502A40] font-bold">
-              <Package className="w-5 h-5" />
-            </div>
-            <div>
-              <h1 className="font-serif font-bold text-base">{wh?.name || 'Wholesaler'} (My Tenant Portal)</h1>
-              <p className="text-xs text-[#C7A67C]">{wh?.city || 'Peshawar'} • Isolated Secure View</p>
-            </div>
-          </div>
-          <button onClick={() => setNavState('gateway')} className="bg-white/10 hover:bg-white/20 text-[#F6F0E8] px-3 py-2 rounded-xl text-xs font-serif flex items-center gap-1.5 transition">
-            <LogOut className="w-3.5 h-3.5" /> Logout
-          </button>
-        </header>
-
-        <div className="max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
-          <div className="flex space-x-2 bg-white p-2 rounded-2xl border border-[#C7A67C]/30 shadow-sm">
-            <button onClick={() => setWholesalerTab('dashboard')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${wholesalerTab === 'dashboard' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>My Dashboard & Profit</button>
-            <button onClick={() => setWholesalerTab('products')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${wholesalerTab === 'products' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>My Catalog & Stock</button>
-            <button onClick={() => setWholesalerTab('suborders')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${wholesalerTab === 'suborders' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>My Suborders ({mySubOrders.length})</button>
-          </div>
+      <div className="app-shell">
+        <PortalHeader
+          icon={Package}
+          title={wh?.name || 'Wholesaler'}
+          subtitle={`${wh?.city || 'Peshawar'} · isolated tenant portal`}
+          onLogout={handleLogout}
+        />
+        <div className="portal-main">
+          <TabRail
+            value={wholesalerTab}
+            onChange={(id) => setWholesalerTab(id as typeof wholesalerTab)}
+            tabs={[
+              { id: 'dashboard', label: 'Dashboard', icon: DollarSign },
+              { id: 'products', label: 'Catalog & stock', icon: Package },
+              { id: 'suborders', label: 'Suborders', icon: CheckCircle2, count: mySubOrders.length },
+            ]}
+          />
 
           {wholesalerTab === 'dashboard' && (
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">My Revenue</span>
-                <span className="text-2xl font-serif font-bold text-[#502A40]">PKR {myRevenue.toLocaleString()}</span>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">My COGS</span>
-                <span className="text-2xl font-serif font-bold text-slate-600">PKR {myCogs.toLocaleString()}</span>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">My Gross Profit</span>
-                <span className="text-2xl font-serif font-bold text-[#C7A67C]">PKR {myProfit.toLocaleString()}</span>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">Status</span>
-                <span className="text-xl font-serif font-bold text-emerald-600 uppercase">{wh?.status}</span>
-              </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+              <KpiCard label="Revenue" value={`PKR ${myRevenue.toLocaleString()}`} />
+              <KpiCard label="COGS" value={`PKR ${myCogs.toLocaleString()}`} tone="muted" />
+              <KpiCard label="Gross profit" value={`PKR ${myProfit.toLocaleString()}`} tone="accent" />
+              <KpiCard label="Tenant status" value={<StatusBadge status={wh?.status || 'unknown'} />} tone="success" />
             </div>
           )}
 
           {wholesalerTab === 'products' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">My Products & Inventory (Isolated)</h3>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm text-slate-700">
-                  <thead className="bg-[#F6F0E8] text-[#502A40] font-serif text-xs uppercase">
-                    <tr><th className="p-3">SKU</th><th className="p-3">Name</th><th className="p-3">Cost</th><th className="p-3">Selling Price</th><th className="p-3">Stock</th></tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {myProducts.map(p => (
-                      <tr key={p.id}>
-                        <td className="p-3 font-serif font-bold text-[#502A40]">{p.sku}</td>
-                        <td className="p-3">{p.name}</td>
-                        <td className="p-3">PKR {p.costPrice.toLocaleString()}</td>
-                        <td className="p-3 font-semibold">PKR {p.sellingPrice.toLocaleString()}</td>
-                        <td className="p-3 text-emerald-600 font-bold">{p.stockOnHand} {p.unit}s</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <h3 className="font-serif font-bold text-brand text-lg">Products & inventory</h3>
+              <AlertBanner>{actionError}</AlertBanner>
+              <form onSubmit={createWholesalerProduct} className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 bg-canvas/60 p-4 rounded-2xl border border-line">
+                <input required placeholder="SKU" value={productForm.sku} onChange={(e) => setProductForm({ ...productForm, sku: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="Product name" value={productForm.name} onChange={(e) => setProductForm({ ...productForm, name: e.target.value })} className="field !py-2.5 !text-xs md:col-span-2" />
+                <input required placeholder="Unit" value={productForm.unit} onChange={(e) => setProductForm({ ...productForm, unit: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="Pack size" value={productForm.packSize} onChange={(e) => setProductForm({ ...productForm, packSize: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="Cost" type="number" value={productForm.costPrice} onChange={(e) => setProductForm({ ...productForm, costPrice: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="Selling price" type="number" value={productForm.sellingPrice} onChange={(e) => setProductForm({ ...productForm, sellingPrice: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="MOQ" type="number" value={productForm.moq} onChange={(e) => setProductForm({ ...productForm, moq: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="Reorder point" type="number" value={productForm.reorderPoint} onChange={(e) => setProductForm({ ...productForm, reorderPoint: e.target.value })} className="field !py-2.5 !text-xs" />
+                <input required placeholder="Stock on hand" type="number" value={productForm.stockOnHand} onChange={(e) => setProductForm({ ...productForm, stockOnHand: e.target.value })} className="field !py-2.5 !text-xs" />
+                <button disabled={productBusy} type="submit" className="btn btn-primary md:col-span-3">{productBusy ? 'Saving…' : 'Add product'}</button>
+              </form>
+              {myProducts.length === 0 ? (
+                <EmptyState icon={Package} title="No products yet" description="Add your first SKU to start receiving shopkeeper orders." />
+              ) : (
+                <div className="data-table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr><th>SKU</th><th>Name</th><th>Cost</th><th>Selling</th><th>Available</th><th>Status</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody>
+                      {myProducts.map((p) => (
+                        <tr key={p.id}>
+                          <td className="font-serif font-bold text-brand">{p.sku}</td>
+                          <td>{p.name}</td>
+                          <td>PKR {p.costPrice.toLocaleString()}</td>
+                          <td className="font-semibold">PKR {p.sellingPrice.toLocaleString()}</td>
+                          <td className="text-success font-bold">{p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved)} {p.unit}s</td>
+                          <td><StatusBadge status={p.status} /></td>
+                          <td>
+                            {p.status !== 'inactive' && (
+                              <button type="button" onClick={() => deactivateWholesalerProduct(p.id)} className="text-xs font-semibold text-danger hover:underline">Deactivate</button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
 
           {wholesalerTab === 'suborders' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">My Suborder Approvals</h3>
-              <div className="space-y-4">
-                {mySubOrders.map(sub => (
-                  <div key={sub.id} className="bg-[#F6F0E8]/40 p-5 rounded-2xl border border-[#C7A67C]/30 flex justify-between items-center">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-serif font-bold text-[#502A40]">{sub.id}</span>
-                        <span className="text-xs bg-[#C7A67C]/20 text-[#502A40] px-2 py-0.5 rounded font-serif">{sub.status}</span>
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <h3 className="font-serif font-bold text-brand text-lg">Incoming suborders</h3>
+              <AlertBanner>{actionError}</AlertBanner>
+              {mySubOrders.length === 0 && <EmptyState icon={CheckCircle2} title="No suborders" description="Approved shopkeeper checkouts will appear here for your tenant." />}
+              <div className="space-y-3">
+                {mySubOrders.map((sub) => (
+                  <article key={sub.id} className="rounded-2xl border border-line bg-canvas/50 p-4 sm:p-5 flex flex-col sm:flex-row sm:justify-between gap-4">
+                    <div className="min-w-0 space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-serif font-bold text-brand">{sub.id}</span>
+                        <StatusBadge status={sub.status} />
                       </div>
-                      <p className="text-xs text-slate-500 mt-1">Client: {sub.clientName} | Order: {sub.orderId}</p>
-                      <ul className="text-xs text-slate-600 mt-2 space-y-1">
+                      <p className="text-xs text-muted">Client: {sub.clientName} · Order {sub.orderId}</p>
+                      <ul className="text-xs text-muted space-y-1">
                         {(sub.items || []).map((it, i) => (
                           <li key={i}>• {it.name} × {it.quantity} {it.unit} (PKR {(it.quantity * it.unitPrice).toLocaleString()})</li>
                         ))}
                       </ul>
                     </div>
                     {sub.status === 'Submitted' && (
-                      <div className="flex gap-2">
-                        <button onClick={() => reviewSubOrder(sub.id, 'Approved')} className="bg-[#502A40] hover:bg-[#683753] text-white px-4 py-2 rounded-xl text-xs font-serif transition shadow">Approve</button>
-                        <button onClick={() => reviewSubOrder(sub.id, 'Rejected')} className="bg-red-50 text-red-600 border border-red-200 px-4 py-2 rounded-xl text-xs font-serif transition">Reject</button>
+                      <div className="flex flex-wrap gap-2 shrink-0">
+                        <button type="button" onClick={() => reviewSubOrder(sub.id, 'Approved')} className="btn btn-primary btn-sm"><Check className="w-3.5 h-3.5" /> Approve</button>
+                        <button type="button" onClick={() => reviewSubOrder(sub.id, 'Rejected')} className="btn btn-danger btn-sm"><X className="w-3.5 h-3.5" /> Reject</button>
                       </div>
                     )}
-                  </div>
+                  </article>
                 ))}
               </div>
             </div>
@@ -985,80 +2137,62 @@ export default function App() {
 
   // ================= 7. ADMIN PORTAL =================
   if (navState === 'admin_portal') {
+    const platformGmv = orders.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
     return (
-      <div className="min-h-screen bg-[#F6F0E8] text-[#502A40] flex flex-col font-sans">
-        <header className="bg-[#502A40] text-[#F6F0E8] px-6 py-4 shadow-md sticky top-0 z-40 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 rounded-xl bg-[#C7A67C] flex items-center justify-center text-[#502A40] font-bold">
-              <ShieldCheck className="w-5 h-5" />
-            </div>
-            <div>
-              <h1 className="font-serif font-bold text-base">Super Admin Control Hub (Sees Everything)</h1>
-              <p className="text-xs text-[#C7A67C]">Platform Governance & Full Auditing</p>
-            </div>
-          </div>
-          <button onClick={() => setNavState('gateway')} className="bg-white/10 hover:bg-white/20 text-[#F6F0E8] px-3 py-2 rounded-xl text-xs font-serif flex items-center gap-1.5 transition">
-            <LogOut className="w-3.5 h-3.5" /> Logout
-          </button>
-        </header>
-
-        <div className="max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
-          <div className="flex flex-wrap gap-2 bg-white p-2 rounded-2xl border border-[#C7A67C]/30 shadow-sm">
-            <button onClick={() => setAdminTab('overview')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${adminTab === 'overview' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>Overview</button>
-            <button onClick={() => setAdminTab('wholesalers')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${adminTab === 'wholesalers' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>Manage Wholesalers</button>
-            <button onClick={() => setAdminTab('all_orders')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${adminTab === 'all_orders' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>All Client Orders & Approvals</button>
-            <button onClick={() => setAdminTab('dispatch')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${adminTab === 'dispatch' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>Dispatch & Logistics</button>
-            <button onClick={() => setAdminTab('audit')} className={`px-4 py-2 rounded-xl text-xs font-serif transition ${adminTab === 'audit' ? 'bg-[#502A40] text-[#F6F0E8]' : 'text-slate-600 hover:bg-[#F6F0E8]'}`}>Audit Logs</button>
-          </div>
+      <div className="app-shell">
+        <PortalHeader
+          icon={ShieldCheck}
+          title="Admin control hub"
+          subtitle="Tenants · dispatch · payments · audit"
+          onLogout={handleLogout}
+        />
+        <div className="portal-main">
+          <TabRail
+            value={adminTab}
+            onChange={(id) => setAdminTab(id as typeof adminTab)}
+            tabs={[
+              { id: 'overview', label: 'Overview', icon: DollarSign },
+              { id: 'wholesalers', label: 'Wholesalers', icon: Users },
+              { id: 'all_orders', label: 'Orders', icon: FileText },
+              { id: 'dispatch', label: 'Dispatch', icon: Truck },
+              { id: 'audit', label: 'Audit', icon: ShieldCheck },
+            ]}
+          />
 
           {adminTab === 'overview' && (
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">Total Gross GMV</span>
-                <span className="text-2xl font-serif font-bold text-[#502A40]">PKR 1,450,200</span>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">Total Wholesalers</span>
-                <span className="text-2xl font-serif font-bold text-emerald-600">{wholesalers.length}</span>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">Total Client Orders</span>
-                <span className="text-2xl font-serif font-bold text-[#502A40]">{orders.length}</span>
-              </div>
-              <div className="bg-white p-6 rounded-3xl border border-[#C7A67C]/30 shadow-xl">
-                <span className="text-xs font-serif text-slate-500 block mb-1">Pending Shipments</span>
-                <span className="text-2xl font-serif font-bold text-[#C7A67C]">{shipments.filter(s => s.status === 'Unassigned').length}</span>
-              </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+              <KpiCard label="Platform GMV" value={`PKR ${platformGmv.toLocaleString()}`} />
+              <KpiCard label="Wholesalers" value={wholesalers.length} tone="success" />
+              <KpiCard label="Client orders" value={orders.length} />
+              <KpiCard label="Unassigned shipments" value={shipments.filter((s) => s.status === 'Unassigned').length} tone="accent" />
             </div>
           )}
 
           {adminTab === 'wholesalers' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <div className="flex justify-between items-center">
-                <h3 className="font-serif font-bold text-[#502A40] text-lg">Wholesaler Tenants Management (Add, Suspend, Reactivate, Remove)</h3>
-                <button onClick={() => setShowAddWholesalerModal(true)} className="bg-[#502A40] hover:bg-[#683753] text-white px-4 py-2 rounded-xl text-xs font-serif transition shadow flex items-center gap-1.5">
-                  <Plus className="w-4 h-4" /> Add New Wholesaler
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <div className="flex flex-wrap justify-between items-center gap-3">
+                <h3 className="font-serif font-bold text-brand text-lg">Wholesaler tenants</h3>
+                <button type="button" onClick={() => setShowAddWholesalerModal(true)} className="btn btn-primary btn-sm">
+                  <Plus className="w-4 h-4" /> Add wholesaler
                 </button>
               </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm text-slate-700">
-                  <thead className="bg-[#F6F0E8] text-[#502A40] font-serif text-xs uppercase">
-                    <tr><th className="p-3">ID</th><th className="p-3">Name</th><th className="p-3">City</th><th className="p-3">Status</th><th className="p-3 text-right">Actions</th></tr>
+              <div className="data-table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr><th>ID</th><th>Name</th><th>City</th><th>Status</th><th className="text-right">Actions</th></tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {wholesalers.map(w => (
+                  <tbody>
+                    {wholesalers.map((w) => (
                       <tr key={w.id}>
-                        <td className="p-3 font-serif font-bold text-[#502A40]">{w.id}</td>
-                        <td className="p-3">{w.name}</td>
-                        <td className="p-3">{w.city}</td>
-                        <td className="p-3"><span className={`px-2 py-0.5 rounded text-xs font-serif ${w.status === 'active' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>{w.status}</span></td>
-                        <td className="p-3 text-right space-x-2">
-                          <button onClick={() => toggleWholesalerStatus(w.id, w.status)} className="bg-[#C7A67C]/20 hover:bg-[#C7A67C]/30 text-[#502A40] px-3 py-1 rounded text-xs font-serif transition">
+                        <td className="font-serif font-bold text-brand">{w.id}</td>
+                        <td>{w.name}</td>
+                        <td>{w.city}</td>
+                        <td><StatusBadge status={w.status} /></td>
+                        <td className="text-right space-x-2 whitespace-nowrap">
+                          <button type="button" onClick={() => toggleWholesalerStatus(w.id, w.status)} className="btn btn-secondary btn-sm">
                             {w.status === 'active' ? 'Suspend' : 'Reactivate'}
                           </button>
-                          <button onClick={() => deleteWholesaler(w.id)} className="bg-red-50 hover:bg-red-100 text-red-600 px-3 py-1 rounded text-xs font-serif transition">
-                            Remove
-                          </button>
+                          <button type="button" onClick={() => deleteWholesaler(w.id)} className="btn btn-danger btn-sm">Remove</button>
                         </td>
                       </tr>
                     ))}
@@ -1069,73 +2203,103 @@ export default function App() {
           )}
 
           {adminTab === 'all_orders' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">All Client Orders & Wholesaler Approvals (Admin Master View)</h3>
-              <div className="space-y-4">
-                {orders.map(ord => (
-                  <div key={ord.id} className="bg-[#F6F0E8]/40 p-5 rounded-2xl border border-[#C7A67C]/30 space-y-3">
-                    <div className="flex justify-between items-center pb-2 border-b border-[#C7A67C]/20">
-                      <div>
-                        <span className="font-serif font-bold text-[#502A40] text-base">{ord.id}</span>
-                        <span className="ml-3 text-xs bg-[#C7A67C]/20 text-[#502A40] px-2.5 py-0.5 rounded font-serif">{ord.status}</span>
-                        <span className="ml-2 text-xs text-slate-500">Client: {ord.clientName}</span>
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <h3 className="font-serif font-bold text-brand text-lg">All client orders</h3>
+              {orders.length === 0 && <EmptyState icon={FileText} title="No orders yet" />}
+              <div className="space-y-3">
+                {orders.map((ord) => (
+                  <article key={ord.id} className="rounded-2xl border border-line bg-canvas/50 p-4 sm:p-5 space-y-3">
+                    <div className="flex flex-wrap justify-between items-center gap-2 pb-2 border-b border-line">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-serif font-bold text-brand">{ord.id}</span>
+                        <StatusBadge status={ord.status} />
+                        <span className="text-xs text-muted">Client: {ord.clientName}</span>
                       </div>
-                      <span className="font-serif font-bold text-[#502A40]">PKR {ord.totalAmount.toLocaleString()}</span>
+                      <span className="font-serif font-bold text-brand">PKR {ord.totalAmount.toLocaleString()}</span>
                     </div>
                     <div className="space-y-2">
-                      <p className="text-xs font-serif font-semibold text-slate-600">Suborders by Wholesaler:</p>
-                      {(ord.subOrders || []).map(sub => {
-                        const wh = wholesalers.find(w => w.id === sub.wholesalerId);
+                      <p className="text-xs font-semibold text-muted">Suborders</p>
+                      {(ord.subOrders || []).map((sub) => {
+                        const wh = wholesalers.find((w) => w.id === sub.wholesalerId);
                         return (
-                          <div key={sub.id} className="bg-white p-3 rounded-xl border border-slate-100 flex justify-between items-center text-xs">
-                            <div>
-                              <span className="font-bold text-[#502A40]">{wh?.name || sub.wholesalerId}</span>: 
-                              <span className="ml-2 text-slate-600">{(sub.items || []).map(it => `${it.name} (${it.quantity} ${it.unit})`).join(', ')}</span>
+                          <div key={sub.id} className="bg-white p-3 rounded-xl border border-line flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 text-xs">
+                            <div className="min-w-0">
+                              <span className="font-bold text-brand">{wh?.name || sub.wholesalerId}</span>
+                              <span className="ml-2 text-muted">{(sub.items || []).map((it) => `${it.name} (${it.quantity} ${it.unit})`).join(', ')}</span>
                             </div>
-                            <span className={`px-2 py-0.5 rounded font-serif ${sub.status === 'Approved' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>{sub.status}</span>
+                            <StatusBadge status={sub.status} />
                           </div>
                         );
                       })}
                     </div>
-                  </div>
+                  </article>
                 ))}
               </div>
             </div>
           )}
 
           {adminTab === 'dispatch' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">Order Dispatch & Delivery Assignment</h3>
-              <div className="space-y-4">
-                {shipments.map(shp => (
-                  <div key={shp.id} className="bg-[#F6F0E8]/40 p-5 rounded-2xl border border-[#C7A67C]/30 flex justify-between items-center">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-serif font-bold text-[#502A40]">{shp.id}</span>
-                        <span className="text-xs bg-[#C7A67C]/20 text-[#502A40] px-2 py-0.5 rounded font-serif">{shp.status}</span>
+            <div className="surface-card p-5 sm:p-6 space-y-5">
+              <h3 className="font-serif font-bold text-brand text-lg">Dispatch & logistics</h3>
+              <AlertBanner>{actionError}</AlertBanner>
+              {shipments.length === 0 && <EmptyState icon={Truck} title="No shipments yet" description="Approve a suborder to create a dispatch queue item." />}
+              <div className="space-y-3">
+                {shipments.map((shp) => (
+                  <article key={shp.id} className="rounded-2xl border border-line bg-canvas/50 p-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-serif font-bold text-brand">{shp.id}</span>
+                        <StatusBadge status={shp.status} />
                       </div>
-                      <p className="text-xs text-slate-500 mt-1">Order: {shp.orderId} | Assigned: {shp.assigneeName || 'Unassigned'}</p>
+                      <p className="text-xs text-muted">Order {shp.orderId} · Assigned: {shp.assigneeName || 'Unassigned'}</p>
+                      {shp.failureReason && <p className="text-xs text-danger">Failure: {shp.failureReason}</p>}
                     </div>
-                    {shp.status === 'Unassigned' && (
-                      <button onClick={() => assignShipment(shp.id)} className="bg-[#502A40] hover:bg-[#683753] text-white px-4 py-2 rounded-xl text-xs font-serif transition shadow">Assign Delivery Partner</button>
+                    {(shp.status === 'Unassigned' || shp.status === 'Failed') && (
+                      <button type="button" onClick={() => assignShipment(shp.id)} className="btn btn-primary btn-sm shrink-0">Assign delivery partner</button>
                     )}
-                  </div>
+                  </article>
                 ))}
+              </div>
+
+              <div className="pt-4 border-t border-line space-y-3">
+                <h4 className="font-serif font-bold text-brand">Record payment</h4>
+                <form onSubmit={recordInvoicePayment} className="grid grid-cols-1 md:grid-cols-5 gap-2">
+                  <select required value={paymentForm.invoiceId} onChange={(e) => setPaymentForm({ ...paymentForm, invoiceId: e.target.value })} className="field !py-2.5 !text-xs md:col-span-2">
+                    <option value="">Select invoice</option>
+                    {invoices.filter((i) => Number(i.outstandingAmount ?? (i.amount - i.paidAmount)) > 0).map((inv) => (
+                      <option key={inv.id} value={inv.id}>{inv.invoiceNumber || inv.id} — outstanding PKR {Number(inv.outstandingAmount ?? (inv.amount - inv.paidAmount)).toLocaleString()}</option>
+                    ))}
+                  </select>
+                  <input required type="number" step="0.01" min="0.01" placeholder="Amount" value={paymentForm.amount} onChange={(e) => setPaymentForm({ ...paymentForm, amount: e.target.value })} className="field !py-2.5 !text-xs" />
+                  <select value={paymentForm.method} onChange={(e) => setPaymentForm({ ...paymentForm, method: e.target.value })} className="field !py-2.5 !text-xs">
+                    <option value="cash">Cash</option>
+                    <option value="bank_transfer">Bank transfer</option>
+                  </select>
+                  <button disabled={paymentBusy} type="submit" className="btn btn-primary">{paymentBusy ? 'Saving…' : 'Post payment'}</button>
+                </form>
+                {payments.length > 0 && (
+                  <div className="text-xs text-muted space-y-1">
+                    {payments.slice(0, 5).map((p) => (
+                      <div key={p.id}>• {p.id}: PKR {p.amount} via {p.method} at {new Date(p.createdAt).toLocaleString()}</div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}
 
           {adminTab === 'audit' && (
-            <div className="bg-white rounded-3xl border border-[#C7A67C]/30 p-6 shadow-xl space-y-4">
-              <h3 className="font-serif font-bold text-[#502A40] text-lg">Immutable Audit Trail</h3>
-              <div className="space-y-3">
-                {auditEvents.map(evt => (
-                  <div key={evt.id} className="bg-[#F6F0E8]/50 p-4 rounded-xl border border-[#C7A67C]/20 flex justify-between items-center">
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <h3 className="font-serif font-bold text-brand text-lg">Immutable audit trail</h3>
+              {auditEvents.length === 0 && <EmptyState icon={ShieldCheck} title="No audit events yet" />}
+              <div className="space-y-2.5">
+                {auditEvents.map((evt) => (
+                  <div key={evt.id} className="bg-canvas/60 p-4 rounded-xl border border-line flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
                     <div>
-                      <span className="text-xs bg-[#502A40] text-[#F6F0E8] px-2 py-0.5 rounded font-mono">{evt.action}</span>
-                      <p className="text-xs text-slate-700 mt-1">{evt.details}</p>
+                      <span className="text-[10px] bg-brand text-canvas px-2 py-0.5 rounded font-mono">{evt.action}</span>
+                      <p className="text-xs text-brand mt-1.5 leading-relaxed">{evt.details}</p>
                     </div>
-                    <span className="text-[10px] text-slate-400">{new Date(evt.timestamp).toLocaleString()}</span>
+                    <span className="text-[10px] text-muted shrink-0">{new Date(evt.timestamp).toLocaleString()}</span>
                   </div>
                 ))}
               </div>
@@ -1143,43 +2307,38 @@ export default function App() {
           )}
         </div>
 
-        {showAddWholesalerModal && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-            <form onSubmit={handleAddWholesaler} className="bg-white border border-[#C7A67C]/40 rounded-3xl p-6 max-w-md w-full space-y-4 shadow-2xl">
-              <h3 className="font-serif font-bold text-[#502A40] text-xl">Add New Wholesaler Tenant</h3>
-              <div className="space-y-3 text-xs">
-                <div>
-                  <label className="font-serif font-semibold text-[#502A40] block mb-1">Wholesaler Name</label>
-                  <input type="text" required value={newWholesalerForm.name} onChange={e => setNewWholesalerForm({ ...newWholesalerForm, name: e.target.value })} placeholder="e.g. Swat Beverages & Drinks" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40]" />
-                </div>
-                <div>
-                  <label className="font-serif font-semibold text-[#502A40] block mb-1">Category</label>
-                  <input type="text" required value={newWholesalerForm.category} onChange={e => setNewWholesalerForm({ ...newWholesalerForm, category: e.target.value })} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40]" />
-                </div>
-                <div>
-                  <label className="font-serif font-semibold text-[#502A40] block mb-1">City / Hub</label>
-                  <input type="text" required value={newWholesalerForm.city} onChange={e => setNewWholesalerForm({ ...newWholesalerForm, city: e.target.value })} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40]" />
-                </div>
-                <div>
-                  <label className="font-serif font-semibold text-[#502A40] block mb-1">Owner Email (Sign In)</label>
-                  <input type="email" required value={newWholesalerForm.ownerEmail} onChange={e => setNewWholesalerForm({ ...newWholesalerForm, ownerEmail: e.target.value })} placeholder="tenant@market.pk" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40]" />
-                </div>
-                <div>
-                  <label className="font-serif font-semibold text-[#502A40] block mb-1">Password</label>
-                  <input type="text" required value={newWholesalerForm.password} onChange={e => setNewWholesalerForm({ ...newWholesalerForm, password: e.target.value })} className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40]" />
-                </div>
-                <div>
-                  <label className="font-serif font-semibold text-[#502A40] block mb-1">Phone</label>
-                  <input type="text" required value={newWholesalerForm.phone} onChange={e => setNewWholesalerForm({ ...newWholesalerForm, phone: e.target.value })} placeholder="+92 300 0000000" className="w-full bg-[#F6F0E8]/50 border border-[#C7A67C]/40 rounded-xl p-3 text-sm text-[#502A40]" />
-                </div>
-              </div>
-              <div className="flex justify-end space-x-3 pt-2">
-                <button type="button" onClick={() => setShowAddWholesalerModal(false)} className="px-4 py-2 rounded-xl text-xs bg-slate-100 text-slate-600 font-serif">Cancel`</button>
-                <button type="submit" className="px-4 py-2 rounded-xl text-xs bg-[#502A40] hover:bg-[#683753] text-white font-serif font-semibold">Create Tenant</button>
-              </div>
-            </form>
-          </div>
-        )}
+        <ModalFrame open={showAddWholesalerModal} onClose={() => setShowAddWholesalerModal(false)} title="Add wholesaler tenant">
+          <form onSubmit={handleAddWholesaler} className="space-y-3">
+            <div>
+              <label className="field-label">Wholesaler name</label>
+              <input type="text" required value={newWholesalerForm.name} onChange={(e) => setNewWholesalerForm({ ...newWholesalerForm, name: e.target.value })} placeholder="e.g. Swat Beverages & Drinks" className="field" />
+            </div>
+            <div>
+              <label className="field-label">Category</label>
+              <input type="text" required value={newWholesalerForm.category} onChange={(e) => setNewWholesalerForm({ ...newWholesalerForm, category: e.target.value })} className="field" />
+            </div>
+            <div>
+              <label className="field-label">City / hub</label>
+              <input type="text" required value={newWholesalerForm.city} onChange={(e) => setNewWholesalerForm({ ...newWholesalerForm, city: e.target.value })} className="field" />
+            </div>
+            <div>
+              <label className="field-label">Owner email</label>
+              <input type="email" required value={newWholesalerForm.ownerEmail} onChange={(e) => setNewWholesalerForm({ ...newWholesalerForm, ownerEmail: e.target.value })} placeholder="tenant@market.pk" className="field" />
+            </div>
+            <div>
+              <label className="field-label">Password</label>
+              <input type="text" required value={newWholesalerForm.password} onChange={(e) => setNewWholesalerForm({ ...newWholesalerForm, password: e.target.value })} className="field" />
+            </div>
+            <div>
+              <label className="field-label">Phone</label>
+              <input type="text" required value={newWholesalerForm.phone} onChange={(e) => setNewWholesalerForm({ ...newWholesalerForm, phone: e.target.value })} placeholder="+92 300 0000000" className="field" />
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button type="button" onClick={() => setShowAddWholesalerModal(false)} className="btn btn-secondary">Cancel</button>
+              <button type="submit" className="btn btn-primary">Create tenant</button>
+            </div>
+          </form>
+        </ModalFrame>
       </div>
     );
   }

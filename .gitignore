@@ -2,7 +2,14 @@ node_modules/
 build/
 dist/
 coverage/
+uploads/
 .DS_Store
 *.log
 .env*
 !.env.example
+
+# Temporary PRD extraction / decode artifacts (not product docs)
+PRD_DECODED.txt
+PRD_DECODED_ACCURATE.txt
+extracted_prd_streams.txt
+extracted_prd_text.txt

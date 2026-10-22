@@ -2,8 +2,67 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import multer from 'multer';
+import { eq } from 'drizzle-orm';
+import { checkDatabaseConnection, getDb } from './src/db';
+import { wholesalers as wholesalersTable } from './src/db/schema';
+import { runMigrations } from './src/db/migrate';
+import { seedDevelopmentData } from './src/db/seed';
+import { authenticate, authorize, optionalAuthenticate } from './src/middleware/auth';
+import { authRateLimit } from './src/middleware/rateLimit';
+import { aiChatRateLimit } from './src/middleware/aiRateLimit';
+import { voiceTtsRateLimit, voiceUploadRateLimit } from './src/middleware/voiceRateLimit';
+import { handleShopkeeperChat } from './src/ai/orchestrator';
+import { getConversationMessages, listConversations } from './src/ai/conversations';
+import { getGeminiDiagnostics, isGeminiConfigured } from './src/ai/gemini';
+import {
+  createTranscriptionFromUpload,
+  getOwnedAudio,
+  processVoiceMessageAuto,
+  submitReviewedTranscript,
+  synthesizeAssistantReply,
+} from './src/ai/voice/service';
+import { MAX_AUDIO_BYTES, MAX_AUDIO_DURATION_MS } from './src/ai/voice/audioValidate';
+import {
+  authenticateUser,
+  createWholesalerAccount,
+  publicUser,
+  registerClient,
+  removeWholesaler,
+  setWholesalerStatus,
+  writeAudit,
+} from './src/auth/service';
+import { HttpError } from './src/auth/rbac';
+import { isProduction } from './src/config/env';
+import { getMarketData } from './src/commerce/market';
+import {
+  addToCart,
+  getCart,
+  removeCartItem,
+  upsertCartItem,
+} from './src/commerce/cart';
+import {
+  createProduct,
+  deactivateProduct,
+  listProductsForUser,
+  updateProduct,
+} from './src/commerce/products';
+import {
+  getOrderForUser,
+  listOrdersForUser,
+  placeOrder,
+  reviewSubOrder,
+} from './src/commerce/orders';
+import {
+  assignShipment,
+  listAssignableDeliveryUsers,
+  listDispatchQueue,
+  listShipmentsForUser,
+  updateShipmentStatus,
+} from './src/commerce/dispatch';
+import { getInvoiceForUser, listInvoicesForUser } from './src/commerce/invoices';
+import { listPaymentsForUser, recordPayment } from './src/commerce/payments';
 
 dotenv.config();
 
@@ -11,592 +70,677 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json());
 
-const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
-const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
-
-interface Wholesaler {
-  id: string;
-  name: string;
-  category: string;
-  city: string;
-  status: 'active' | 'suspended';
-  ownerEmail: string;
-  phone: string;
-  rating: number;
-  password?: string;
+function handleHttpError(err: unknown, res: express.Response, fallback: string) {
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  console.error(err);
+  return res.status(500).json({ error: fallback });
 }
 
-interface Product {
-  id: string;
-  wholesalerId: string;
-  sku: string;
-  name: string;
-  aliases: { en: string; ur: string; ps: string };
-  unit: string;
-  packSize: string;
-  costPrice: number;
-  sellingPrice: number;
-  moq: number;
-  reorderPoint: number;
-  stockOnHand: number;
-  stockReserved: number;
-  status: 'available' | 'low_stock' | 'out_of_stock';
-}
-
-interface SubOrder {
-  id: string;
-  wholesalerId: string;
-  items: { productId: string; name: string; quantity: number; unitPrice: number; unit: string }[];
-  subtotal: number;
-  status: string;
-  rejectReason?: string;
-}
-
-interface Order {
-  id: string;
-  clientId: string;
-  clientName: string;
-  deliveryAddress: string;
-  status: string;
-  subOrders: SubOrder[];
-  totalAmount: number;
-  createdAt: string;
-  paymentStatus: string;
-  paidAmount: number;
-}
-
-interface Shipment {
-  id: string;
-  orderId: string;
-  wholesalerId: string;
-  assigneeId?: string;
-  assigneeName?: string;
-  status: string;
-  expectedDate: string;
-  proofNotes?: string;
-}
-
-interface Invoice {
-  id: string;
-  orderId: string;
-  wholesalerId: string;
-  amount: number;
-  paidAmount: number;
-  status: string;
-  createdAt: string;
-}
-
-interface AuditEvent {
-  id: string;
-  timestamp: string;
-  actor: string;
-  role: string;
-  action: string;
-  details: string;
-}
-
-interface ClientUser {
-  id: string;
-  name: string;
-  storeName: string;
-  phone: string;
-}
-
-// Seed Data
-let wholesalers: Wholesaler[] = [
-  { id: 'W001', name: 'Khyber Grain & Flour Mills', category: 'Grains & Flour', city: 'Peshawar', status: 'active', ownerEmail: 'wholesaler1@market.pk', phone: '+92 300 1234567', rating: 4.8, password: 'password123' },
-  { id: 'W002', name: 'Peshawar Electronics & Solar', category: 'Electronics & Solar', city: 'Karkhano Market', status: 'active', ownerEmail: 'wholesaler2@market.pk', phone: '+92 301 7654321', rating: 4.6, password: 'password123' },
-  { id: 'W003', name: 'Frontier Spices & Dry Fruits', category: 'Spices & Dry Fruits', city: 'Peshawar', status: 'active', ownerEmail: 'wholesaler3@market.pk', phone: '+92 302 9876543', rating: 4.9, password: 'password123' },
-];
-
-let clients: ClientUser[] = [
-  { id: 'CLI-01', name: 'Babar Khan', storeName: 'Babar General Store', phone: '03009876543' }
-];
-
-let products: Product[] = [
-  {
-    id: 'P101',
-    wholesalerId: 'W001',
-    sku: 'FLOUR-SUPER-50KG',
-    name: 'Super Fine Wheat Flour (50kg Bag)',
-    aliases: { en: 'Wheat Flour Bag 50kg', ur: 'گندم کا آٹا 50 کلو', ps: 'غنم اوړه 50 کیلو' },
-    unit: 'bag',
-    packSize: '50kg bag',
-    costPrice: 6200,
-    sellingPrice: 6800,
-    moq: 2,
-    reorderPoint: 20,
-    stockOnHand: 150,
-    stockReserved: 10,
-    status: 'available'
-  },
-  {
-    id: 'P102',
-    wholesalerId: 'W001',
-    sku: 'RICE-BASMATI-25KG',
-    name: 'Khyber Premium Basmati Rice (25kg)',
-    aliases: { en: 'Basmati Rice 25kg', ur: 'باسമതി چاول 25 کلو', ps: 'باسمتی وریجې 25 کیلو' },
-    unit: 'bag',
-    packSize: '25kg bag',
-    costPrice: 9500,
-    sellingPrice: 10500,
-    moq: 1,
-    reorderPoint: 15,
-    stockOnHand: 80,
-    stockReserved: 5,
-    status: 'available'
-  },
-  {
-    id: 'P103',
-    wholesalerId: 'W001',
-    sku: 'COOKING-OIL-16L',
-    name: 'Pure Banaspati Cooking Oil (16L Tin)',
-    aliases: { en: 'Cooking Oil Tin 16L', ur: 'کوکنگ آئل 16 لٹر', ps: 'پخولو غوړي 16 لټره' },
-    unit: 'carton',
-    packSize: '16 Liter Tin',
-    costPrice: 5400,
-    sellingPrice: 5900,
-    moq: 2,
-    reorderPoint: 25,
-    stockOnHand: 120,
-    stockReserved: 0,
-    status: 'available'
-  },
-  {
-    id: 'P201',
-    wholesalerId: 'W002',
-    sku: 'SOLAR-PANEL-550W',
-    name: 'Mono Perc Solar Panel 550W Tier-1',
-    aliases: { en: '550W Solar Panel', ur: 'سولر پینل 550 واٹ', ps: 'سولر پینل 550 واټ' },
-    unit: 'piece',
-    packSize: '1 piece',
-    costPrice: 28500,
-    sellingPrice: 31000,
-    moq: 2,
-    reorderPoint: 10,
-    stockOnHand: 45,
-    stockReserved: 4,
-    status: 'available'
-  },
-  {
-    id: 'P301',
-    wholesalerId: 'W003',
-    sku: 'SPICE-RED-CHILI-5KG',
-    name: 'Peshawari Red Chili Powder (5kg)',
-    aliases: { en: 'Red Chili Powder 5kg', ur: 'سرخ مرچ پاؤڈر 5 کلو', ps: 'سرخ مرچ پوډر 5 کیلو' },
-    unit: 'bag',
-    packSize: '5kg pack',
-    costPrice: 3200,
-    sellingPrice: 3600,
-    moq: 2,
-    reorderPoint: 10,
-    stockOnHand: 60,
-    stockReserved: 0,
-    status: 'available'
-  }
-];
-
-let orders: Order[] = [
-  {
-    id: 'ORD-1001',
-    clientId: 'CLI-01',
-    clientName: 'Babar General Store (Peshawar)',
-    deliveryAddress: 'University Road, near Islamia College, Peshawar',
-    status: 'Approved',
-    subOrders: [
-      {
-        id: 'SUB-1001-1',
-        wholesalerId: 'W001',
-        items: [
-          { productId: 'P101', name: 'Super Fine Wheat Flour (50kg Bag)', quantity: 5, unitPrice: 6800, unit: 'bag' },
-          { productId: 'P103', name: 'Pure Banaspati Cooking Oil (16L Tin)', quantity: 4, unitPrice: 5900, unit: 'carton' }
-        ],
-        subtotal: 57600,
-        status: 'Approved'
-      }
-    ],
-    totalAmount: 57600,
-    createdAt: new Date(Date.now() - 3600000 * 4).toISOString(),
-    paymentStatus: 'Unpaid',
-    paidAmount: 0
-  }
-];
-
-let shipments: Shipment[] = [
-  {
-    id: 'SHP-9001',
-    orderId: 'ORD-1001',
-    wholesalerId: 'W001',
-    assigneeId: 'DRV-01',
-    assigneeName: 'Gul Khan Logistics',
-    status: 'Assigned',
-    expectedDate: new Date(Date.now() + 86400000).toISOString()
-  }
-];
-
-let invoices: Invoice[] = [
-  {
-    id: 'INV-5001',
-    orderId: 'ORD-1001',
-    wholesalerId: 'W001',
-    amount: 57600,
-    paidAmount: 0,
-    status: 'Issued',
-    createdAt: new Date(Date.now() - 3600000 * 3).toISOString()
-  }
-];
-
-let auditEvents: AuditEvent[] = [
-  {
-    id: 'ADT-101',
-    timestamp: new Date(Date.now() - 3600000 * 5).toISOString(),
-    actor: 'Super Admin',
-    role: 'Admin',
-    action: 'SYSTEM_INIT',
-    details: 'System initialized with 3 wholesalers and seeded catalog items.'
-  }
-];
-
-// API Endpoints
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-app.get('/api/market/data', (req, res) => {
-  res.json({
-    wholesalers,
-    products,
-    orders,
-    shipments,
-    invoices,
-    auditEvents,
-    clients
-  });
-});
-
-// Auth endpoints
-app.post('/api/auth/client/signup', (req, res) => {
-  const { name, storeName, phone } = req.body;
-  if (!name || !storeName || !phone) {
-    return res.status(400).json({ error: 'Name, store name and phone number are required.' });
-  }
-  const existing = clients.find(c => c.phone === phone);
-  if (existing) {
-    return res.json({ success: true, client: existing });
-  }
-  const newClient: ClientUser = {
-    id: `CLI-${Date.now()}`,
-    name,
-    storeName,
-    phone
-  };
-  clients.push(newClient);
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: name,
-    role: 'Shopkeeper',
-    action: 'CLIENT_SIGNUP',
-    details: `New client signed up: ${storeName} (${phone})`
-  });
-  res.json({ success: true, client: newClient });
-});
-
-app.post('/api/auth/client/signin', (req, res) => {
-  const { phone } = req.body;
-  const client = clients.find(c => c.phone === phone);
-  if (!client) {
-    return res.status(401).json({ error: 'Client not found with this phone number. Please sign up first.' });
-  }
-  res.json({ success: true, client });
-});
-
-app.post('/api/auth/wholesaler/signin', (req, res) => {
-  const { email, password } = req.body;
-  const wholesaler = wholesalers.find(w => w.ownerEmail === email);
-  if (!wholesaler || wholesaler.password !== password) {
-    return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
-  }
-  if (wholesaler.status === 'suspended') {
-    return res.status(403).json({ error: 'This wholesaler account has been suspended by Admin.' });
-  }
-  res.json({ success: true, wholesaler });
-});
-
-app.post('/api/auth/admin/signin', (req, res) => {
-  const { email, password } = req.body;
-  if (email === 'admin@market.pk' && password === 'admin123') {
-    res.json({ success: true, admin: { name: 'Super Admin', email: 'admin@market.pk' } });
-  } else {
-    res.status(401).json({ error: 'Wrong admin email or password.' });
-  }
-});
-
-// Wholesaler Management (Add, Suspend, Reactivate, Remove)
-app.post('/api/wholesalers', (req, res) => {
-  const { name, category, city, ownerEmail, phone, password } = req.body;
-  const newWholesaler: Wholesaler = {
-    id: `W00${wholesalers.length + 1}`,
-    name,
-    category,
-    city,
-    status: 'active',
-    ownerEmail,
-    phone,
-    rating: 5.0,
-    password: password || 'password123'
-  };
-  wholesalers.push(newWholesaler);
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: 'Super Admin',
-    role: 'Admin',
-    action: 'CREATE_WHOLESALER',
-    details: `Created wholesaler tenant: ${name} (${newWholesaler.id})`
-  });
-  res.json({ success: true, wholesaler: newWholesaler });
-});
-
-app.patch('/api/wholesalers/:id/status', (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body; // 'active' or 'suspended'
-  const wh = wholesalers.find(w => w.id === id);
-  if (!wh) return res.status(404).json({ error: 'Wholesaler not found' });
-  wh.status = status;
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: 'Super Admin',
-    role: 'Admin',
-    action: 'UPDATE_WHOLESALER_STATUS',
-    details: `Updated wholesaler ${wh.name} status to ${status}`
-  });
-  res.json({ success: true, wholesaler: wh });
-});
-
-app.delete('/api/wholesalers/:id', (req, res) => {
-  const { id } = req.params;
-  const idx = wholesalers.findIndex(w => w.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Wholesaler not found' });
-  const removed = wholesalers.splice(idx, 1)[0];
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: 'Super Admin',
-    role: 'Admin',
-    action: 'DELETE_WHOLESALER',
-    details: `Permanently removed wholesaler tenant: ${removed.name} (${removed.id})`
-  });
-  res.json({ success: true, removed });
-});
-
-// Orders & AI Chat
-app.post('/api/orders', (req, res) => {
-  const { clientId, clientName, deliveryAddress, cartItems } = req.body;
-  const grouped: { [wholesalerId: string]: { productId: string; name: string; quantity: number; unitPrice: number; unit: string }[] } = {};
-  
-  let totalAmount = 0;
-  for (const item of cartItems) {
-    const prod = products.find(p => p.id === item.productId);
-    if (!prod) continue;
-    if (!grouped[prod.wholesalerId]) {
-      grouped[prod.wholesalerId] = [];
-    }
-    const lineTotal = prod.sellingPrice * item.quantity;
-    totalAmount += lineTotal;
-    grouped[prod.wholesalerId].push({
-      productId: prod.id,
-      name: prod.name,
-      quantity: item.quantity,
-      unitPrice: prod.sellingPrice,
-      unit: prod.unit
-    });
-  }
-
-  const subOrders: SubOrder[] = Object.keys(grouped).map((whId, idx) => {
-    const items = grouped[whId];
-    const subtotal = items.reduce((acc, curr) => acc + (curr.quantity * curr.unitPrice), 0);
-    return {
-      id: `SUB-${Date.now()}-${idx + 1}`,
-      wholesalerId: whId,
-      items,
-      subtotal,
-      status: 'Submitted'
-    };
-  });
-
-  const newOrder: Order = {
-    id: `ORD-${Math.floor(1000 + Math.random() * 9000)}`,
-    clientId: clientId || 'CLI-01',
-    clientName: clientName || 'Babar General Store',
-    deliveryAddress: deliveryAddress || 'University Road, Peshawar',
-    status: 'Submitted',
-    subOrders,
-    totalAmount,
-    createdAt: new Date().toISOString(),
-    paymentStatus: 'Unpaid',
-    paidAmount: 0
-  };
-
-  orders.unshift(newOrder);
-
-  subOrders.forEach((sub, idx) => {
-    invoices.unshift({
-      id: `INV-${Date.now()}-${idx}`,
-      orderId: newOrder.id,
-      wholesalerId: sub.wholesalerId,
-      amount: sub.subtotal,
-      paidAmount: 0,
-      status: 'Issued',
-      createdAt: new Date().toISOString()
-    });
-  });
-
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: clientName || 'Shopkeeper',
-    role: 'Shopkeeper',
-    action: 'ORDER_SUBMITTED',
-    details: `Order ${newOrder.id} submitted with ${subOrders.length} suborders totaling PKR ${totalAmount}`
-  });
-
-  res.json({ success: true, order: newOrder });
-});
-
-app.patch('/api/suborders/:subOrderId/review', (req, res) => {
-  const { subOrderId } = req.params;
-  const { action, rejectReason } = req.body;
-  
-  let targetSub: SubOrder | undefined;
-  let targetOrder: Order | undefined;
-
-  for (const ord of orders) {
-    const sub = ord.subOrders.find(s => s.id === subOrderId);
-    if (sub) {
-      targetSub = sub;
-      targetOrder = ord;
-      break;
-    }
-  }
-
-  if (!targetSub || !targetOrder) {
-    return res.status(404).json({ error: 'Suborder not found' });
-  }
-
-  targetSub.status = action;
-  if (action === 'Rejected' && rejectReason) {
-    targetSub.rejectReason = rejectReason;
-  }
-
-  if (action === 'Approved') {
-    for (const item of targetSub.items) {
-      const prod = products.find(p => p.id === item.productId);
-      if (prod) {
-        prod.stockReserved += item.quantity;
-        prod.stockOnHand = Math.max(0, prod.stockOnHand - item.quantity);
-      }
-    }
-    shipments.push({
-      id: `SHP-${Math.floor(1000 + Math.random() * 9000)}`,
-      orderId: targetOrder.id,
-      wholesalerId: targetSub.wholesalerId,
-      status: 'Unassigned',
-      expectedDate: new Date(Date.now() + 86400000 * 2).toISOString()
-    });
-  }
-
-  const allStatuses = targetOrder.subOrders.map(s => s.status);
-  if (allStatuses.every(s => s === 'Approved')) {
-    targetOrder.status = 'Approved';
-  } else if (allStatuses.some(s => s === 'Approved') && allStatuses.some(s => s === 'Submitted' || s === 'In Review')) {
-    targetOrder.status = 'Partially Approved';
-  } else if (allStatuses.every(s => s === 'Rejected')) {
-    targetOrder.status = 'Cancelled';
-  }
-
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: `Wholesaler (${targetSub.wholesalerId})`,
-    role: 'Wholesaler',
-    action: `SUBORDER_${action.toUpperCase()}`,
-    details: `Suborder ${targetSub.id} was ${action.toLowerCase()}`
-  });
-
-  res.json({ success: true, order: targetOrder });
-});
-
-app.patch('/api/shipments/:shipmentId/assign', (req, res) => {
-  const { shipmentId } = req.params;
-  const { assigneeId, assigneeName } = req.body;
-  const shp = shipments.find(s => s.id === shipmentId);
-  if (!shp) return res.status(404).json({ error: 'Shipment not found' });
-  
-  shp.assigneeId = assigneeId || 'DRV-01';
-  shp.assigneeName = assigneeName || 'Gul Khan Logistics';
-  shp.status = 'Assigned';
-
-  auditEvents.unshift({
-    id: `ADT-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    actor: 'Super Admin',
-    role: 'Admin',
-    action: 'ASSIGN_SHIPMENT',
-    details: `Assigned shipment ${shp.id} to ${shp.assigneeName}`
-  });
-
-  res.json({ success: true, shipment: shp });
-});
-
-app.post('/api/ai/chat', async (req, res) => {
-  const { message, language = 'en' } = req.body;
-  if (!ai) {
-    return res.json({
-      reply: `[AI Assistant] I received your request regarding "${message}". Browse our general store inventory of drinks, snacks, and wholesale staples below!`,
-      detectedLanguage: language,
-      suggestedProducts: products.slice(0, 3)
-    });
-  }
-
+app.get('/api/health', async (_req, res) => {
   try {
-    const catalogSummary = products.map(p => `${p.name} (SKU: ${p.sku}, Price: PKR ${p.sellingPrice} per ${p.unit}, Stock: ${p.stockOnHand})`).join('\n');
-    const prompt = `You are the AI Assistant for Peshawar Wholesale Market General Store & Drinks Platform.
-Catalog:
-${catalogSummary}
-User message: "${message}"
-Respond helpfully in ${language} with prices and units.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt
-    });
-
-    const textReply = response.text || '';
-    const matchedProducts = products.filter((p: Product) => 
-      message.toLowerCase().split(' ').some((word: string) => 
-        word.length > 2 && (p.name.toLowerCase().includes(word) || p.sku.toLowerCase().includes(word))
-      )
-    );
-
-    res.json({
-      reply: textReply,
-      detectedLanguage: language,
-      suggestedProducts: matchedProducts.length > 0 ? matchedProducts : products.slice(0, 2)
-    });
+    const connected = await checkDatabaseConnection();
+    res.json({ status: 'ok', database: connected ? 'connected' : 'disconnected', time: new Date().toISOString() });
   } catch (err: any) {
+    res.status(503).json({ status: 'degraded', database: 'disconnected', error: err.message, time: new Date().toISOString() });
+  }
+});
+
+app.get('/api/market/data', optionalAuthenticate, async (req, res) => {
+  try {
+    const data = await getMarketData(req.user);
+    res.json(data);
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to load market data.');
+  }
+});
+
+app.post('/api/auth/client/signup', authRateLimit, async (req, res) => {
+  try {
+    const { name, storeName, phone, password } = req.body;
+    const { user, token } = await registerClient({ name, storeName, phone, password });
+    const client = { id: user.id, name: user.name, storeName: user.storeName || storeName, phone: user.phone || phone };
+    await writeAudit(name, 'Shopkeeper', 'CLIENT_SIGNUP', `New client signed up: ${storeName} (${phone})`);
+    res.json({ success: true, token, client, user: publicUser(user) });
+  } catch (err) {
+    handleHttpError(err, res, 'Client signup failed.');
+  }
+});
+
+app.post('/api/auth/client/signin', authRateLimit, async (req, res) => {
+  try {
+    const { phone, password } = req.body;
+    const { user, token } = await authenticateUser({ phone, password, expectedRole: 'client' });
+    const client = {
+      id: user.id,
+      name: user.name,
+      storeName: user.storeName || '',
+      phone: user.phone || phone,
+    };
+    res.json({ success: true, token, client, user: publicUser(user) });
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 401) {
+      return res.status(401).json({ error: 'Client not found with this phone number. Please sign up first.' });
+    }
+    handleHttpError(err, res, 'Client sign in failed.');
+  }
+});
+
+app.post('/api/auth/wholesaler/signin', authRateLimit, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { user, token } = await authenticateUser({ email, password, expectedRole: 'wholesaler' });
+    if (!user.tenantId) {
+      return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
+    }
+    const [wholesaler] = await getDb().select().from(wholesalersTable).where(eq(wholesalersTable.id, user.tenantId)).limit(1);
+    if (!wholesaler) {
+      return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
+    }
     res.json({
-      reply: `I understand you are asking about "${message}". Please review our available drinks and general store items.`,
-      detectedLanguage: language,
-      suggestedProducts: products.slice(0, 2)
+      success: true,
+      token,
+      wholesaler: {
+        id: wholesaler.id,
+        name: wholesaler.name,
+        category: wholesaler.category,
+        city: wholesaler.city,
+        status: wholesaler.status,
+        ownerEmail: wholesaler.ownerEmail,
+        phone: wholesaler.phone,
+        rating: Number(wholesaler.rating),
+      },
+      user: publicUser(user),
     });
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 401) {
+      return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
+    }
+    if (err instanceof HttpError && err.status === 403) {
+      return res.status(403).json({ error: 'This wholesaler account has been suspended by Admin.' });
+    }
+    handleHttpError(err, res, 'Wholesaler sign in failed.');
+  }
+});
+
+app.post('/api/auth/admin/signin', authRateLimit, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { user, token } = await authenticateUser({ email, password, expectedRole: 'admin' });
+    res.json({
+      success: true,
+      token,
+      admin: { name: user.name, email: user.email },
+      user: publicUser(user),
+    });
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 401) {
+      return res.status(401).json({ error: 'Wrong admin email or password.' });
+    }
+    handleHttpError(err, res, 'Admin sign in failed.');
+  }
+});
+
+app.post('/api/auth/delivery/signin', authRateLimit, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { user, token } = await authenticateUser({ email, password, expectedRole: 'delivery' });
+    res.json({
+      success: true,
+      token,
+      delivery: { id: user.id, name: user.name, email: user.email },
+      user: publicUser(user),
+    });
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 401) {
+      return res.status(401).json({ error: 'Wrong delivery email or password.' });
+    }
+    handleHttpError(err, res, 'Delivery sign in failed.');
+  }
+});
+
+app.post('/api/wholesalers', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const { name, category, city, ownerEmail, phone, password } = req.body;
+    const wholesaler = await createWholesalerAccount({ name, category, city, ownerEmail, phone, password });
+    await writeAudit(req.user?.name || 'Super Admin', 'Admin', 'CREATE_WHOLESALER', `Created wholesaler tenant: ${name} (${wholesaler.id})`);
+    res.json({ success: true, wholesaler });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to create wholesaler.');
+  }
+});
+
+app.patch('/api/wholesalers/:id/status', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (status !== 'active' && status !== 'suspended') {
+      return res.status(400).json({ error: 'Status must be active or suspended.' });
+    }
+    const wholesaler = await setWholesalerStatus(id, status);
+    await writeAudit(req.user?.name || 'Super Admin', 'Admin', 'UPDATE_WHOLESALER_STATUS', `Updated wholesaler ${wholesaler.name} status to ${status}`);
+    res.json({ success: true, wholesaler });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to update wholesaler.');
+  }
+});
+
+app.delete('/api/wholesalers/:id', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const removed = await removeWholesaler(id);
+    await writeAudit(req.user?.name || 'Super Admin', 'Admin', 'DELETE_WHOLESALER', `Permanently removed wholesaler tenant: ${removed.name} (${removed.id})`);
+    res.json({ success: true, removed });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to delete wholesaler.');
+  }
+});
+
+app.get('/api/products', authenticate, async (req, res) => {
+  try {
+    const products = await listProductsForUser(req.user);
+    res.json({ success: true, products });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list products.');
+  }
+});
+
+app.post('/api/products', authenticate, authorize(['wholesaler']), async (req, res) => {
+  try {
+    const product = await createProduct(req.user!, req.body);
+    await writeAudit(req.user!.name, 'Wholesaler', 'PRODUCT_CREATE', `Created product ${product.sku}`);
+    res.status(201).json({ success: true, product });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to create product.');
+  }
+});
+
+app.patch('/api/products/:id', authenticate, authorize(['wholesaler']), async (req, res) => {
+  try {
+    const product = await updateProduct(req.user!, req.params.id, req.body);
+    await writeAudit(req.user!.name, 'Wholesaler', 'PRODUCT_UPDATE', `Updated product ${product.sku}`);
+    res.json({ success: true, product });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to update product.');
+  }
+});
+
+app.post('/api/products/:id/deactivate', authenticate, authorize(['wholesaler']), async (req, res) => {
+  try {
+    const product = await deactivateProduct(req.user!, req.params.id);
+    await writeAudit(req.user!.name, 'Wholesaler', 'PRODUCT_DEACTIVATE', `Deactivated product ${product.sku}`);
+    res.json({ success: true, product });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to deactivate product.');
+  }
+});
+
+app.get('/api/cart', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const cart = await getCart(req.user!);
+    res.json({ success: true, cart });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to load cart.');
+  }
+});
+
+app.post('/api/cart/items', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const { productId, quantity, mode } = req.body;
+    if (!productId) return res.status(400).json({ error: 'productId is required.' });
+    const cart =
+      mode === 'set'
+        ? await upsertCartItem(req.user!, productId, Number(quantity))
+        : await addToCart(req.user!, productId, Number(quantity ?? 1));
+    res.json({ success: true, cart });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to update cart.');
+  }
+});
+
+app.delete('/api/cart/items/:productId', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const cart = await removeCartItem(req.user!, req.params.productId);
+    res.json({ success: true, cart });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to remove cart item.');
+  }
+});
+
+app.get('/api/orders', authenticate, authorize(['client', 'wholesaler', 'admin']), async (req, res) => {
+  try {
+    const orders = await listOrdersForUser(req.user!);
+    res.json({ success: true, orders });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list orders.');
+  }
+});
+
+app.get('/api/orders/:id', authenticate, authorize(['client', 'wholesaler', 'admin']), async (req, res) => {
+  try {
+    const order = await getOrderForUser(req.user!, req.params.id);
+    res.json({ success: true, order });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to load order.');
+  }
+});
+
+app.post('/api/orders', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const idempotencyKey =
+      (typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : undefined) ||
+      req.body.idempotencyKey;
+    const order = await placeOrder(req.user!, {
+      deliveryAddress: req.body.deliveryAddress,
+      confirmed: req.body.confirmed === true,
+      idempotencyKey,
+    });
+    res.status(201).json({ success: true, order });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to place order.');
+  }
+});
+
+app.patch('/api/suborders/:subOrderId/review', authenticate, authorize(['wholesaler', 'admin']), async (req, res) => {
+  try {
+    const { action, rejectReason } = req.body;
+    const order = await reviewSubOrder(req.user!, req.params.subOrderId, action, rejectReason);
+    res.json({ success: true, order });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to review suborder.');
+  }
+});
+
+app.get('/api/shipments', authenticate, authorize(['admin', 'delivery', 'wholesaler', 'client']), async (req, res) => {
+  try {
+    const shipments = await listShipmentsForUser(req.user!);
+    res.json({ success: true, shipments });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list shipments.');
+  }
+});
+
+app.get('/api/dispatch/queue', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const queue = await listDispatchQueue(req.user!);
+    const deliveryUsers = await listAssignableDeliveryUsers();
+    res.json({
+      success: true,
+      ...queue,
+      deliveryUsers: deliveryUsers.map((u) => ({ id: u.id, name: u.name, email: u.email })),
+    });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to load dispatch queue.');
+  }
+});
+
+app.patch('/api/shipments/:shipmentId/assign', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const shipment = await assignShipment(req.user!, req.params.shipmentId, {
+      assigneeId: req.body.assigneeId || 'DRV-01',
+      assigneeName: req.body.assigneeName,
+      trackingRef: req.body.trackingRef,
+      expectedDate: req.body.expectedDate,
+    });
+    res.json({ success: true, shipment });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to assign shipment.');
+  }
+});
+
+app.patch('/api/shipments/:shipmentId/status', authenticate, authorize(['admin', 'delivery']), async (req, res) => {
+  try {
+    const idempotencyKey =
+      (typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : undefined) ||
+      req.body.idempotencyKey;
+    const shipment = await updateShipmentStatus(req.user!, req.params.shipmentId, {
+      status: req.body.status,
+      proofNotes: req.body.proofNotes,
+      failureReason: req.body.failureReason,
+      idempotencyKey,
+    });
+    res.json({ success: true, shipment });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to update shipment status.');
+  }
+});
+
+app.get('/api/invoices', authenticate, authorize(['admin', 'wholesaler', 'client']), async (req, res) => {
+  try {
+    const invoices = await listInvoicesForUser(req.user!);
+    res.json({ success: true, invoices });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list invoices.');
+  }
+});
+
+app.get('/api/invoices/:id', authenticate, authorize(['admin', 'wholesaler', 'client']), async (req, res) => {
+  try {
+    const invoice = await getInvoiceForUser(req.user!, req.params.id);
+    res.json({ success: true, invoice });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to load invoice.');
+  }
+});
+
+app.get('/api/payments', authenticate, authorize(['admin', 'wholesaler', 'client']), async (req, res) => {
+  try {
+    const payments = await listPaymentsForUser(req.user!);
+    res.json({ success: true, payments });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list payments.');
+  }
+});
+
+app.post('/api/payments', authenticate, authorize(['admin', 'wholesaler']), async (req, res) => {
+  try {
+    const idempotencyKey =
+      (typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : undefined) ||
+      req.body.idempotencyKey;
+    const result = await recordPayment(req.user!, {
+      invoiceId: req.body.invoiceId,
+      amount: req.body.amount,
+      method: req.body.method,
+      reference: req.body.reference,
+      notes: req.body.notes,
+      idempotencyKey,
+    });
+    res.status(201).json({ success: true, ...result });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to record payment.');
+  }
+});
+
+const voiceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_AUDIO_BYTES, files: 1 },
+});
+
+app.get('/api/ai/status', authenticate, authorize(['client']), (_req, res) => {
+  const diag = getGeminiDiagnostics();
+  res.json({
+    success: true,
+    geminiConfigured: isGeminiConfigured(),
+    mode: isGeminiConfigured() ? 'gemini+tools' : 'deterministic-agents',
+    gemini: diag,
+    voice: {
+      maxBytes: MAX_AUDIO_BYTES,
+      maxDurationMs: MAX_AUDIO_DURATION_MS,
+      transcription: isGeminiConfigured() ? 'gemini' : 'unavailable',
+      tts: isGeminiConfigured() ? 'gemini-optional' : 'unavailable',
+      pashtoTtsVerified: false,
+      urduTtsVerified: false,
+      whatsappStyleAutoSend: true,
+      reviewModeOptional: true,
+      requiresTranscriptReview: false,
+      autoSubmitDisabled: false,
+    },
+  });
+});
+
+app.get('/api/ai/conversations', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const rows = await listConversations(req.user!);
+    res.json({ success: true, conversations: rows });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list conversations.');
+  }
+});
+
+app.get('/api/ai/conversations/:id/messages', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const data = await getConversationMessages(req.user!, req.params.id);
+    res.json({
+      success: true,
+      conversation: data.conversation,
+      messages: data.messages.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        language: m.language,
+        metadata: m.metadata,
+        createdAt: m.createdAt,
+      })),
+    });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to load conversation.');
+  }
+});
+
+app.post('/api/ai/chat', authenticate, authorize(['client']), aiChatRateLimit, async (req, res) => {
+  try {
+    const message = typeof req.body.message === 'string' ? req.body.message : '';
+    const language = typeof req.body.language === 'string' ? req.body.language : 'en';
+    const conversationId = typeof req.body.conversationId === 'string' ? req.body.conversationId : undefined;
+    if (!message.trim()) {
+      return res.status(400).json({ error: 'Message is required.' });
+    }
+    if (message.length > 2000) {
+      return res.status(400).json({ error: 'Message too long (max 2000 characters).' });
+    }
+
+    const result = await handleShopkeeperChat(req.user!, { message, language, conversationId });
+    res.json({
+      success: true,
+      reply: result.reply,
+      detectedLanguage: result.detectedLanguage,
+      suggestedProducts: result.suggestedProducts,
+      cart: result.cart,
+      needsConfirmation: result.needsConfirmation,
+      clarificationNeeded: result.clarificationNeeded,
+      conversationId: result.conversationId,
+      messageId: result.messageId,
+      toolCalls: result.toolCalls,
+      geminiUsed: result.geminiUsed,
+      geminiModel: result.geminiModel,
+      fallbackReason: result.fallbackReason,
+      action: result.action,
+      // Never place orders from AI chat alone
+      orderPlaced: false,
+    });
+  } catch (err) {
+    handleHttpError(err, res, 'AI assistant is temporarily unavailable. Please try again.');
+  }
+});
+
+app.post(
+  '/api/ai/voice/transcribe',
+  authenticate,
+  authorize(['client']),
+  voiceUploadRateLimit,
+  (req, res, next) => {
+    voiceUpload.single('audio')(req, res, (err: any) => {
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: `Audio exceeds maximum size of ${MAX_AUDIO_BYTES} bytes.` });
+        }
+        return res.status(400).json({ error: err.message });
+      }
+      if (err) return res.status(400).json({ error: 'Audio upload failed.' });
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      const file = req.file;
+      if (!file?.buffer?.length) {
+        return res.status(400).json({ error: 'Audio file is required (field name: audio).' });
+      }
+      const durationRaw = req.body?.durationMs;
+      const durationMs = durationRaw != null && durationRaw !== '' ? Number(durationRaw) : null;
+      const result = await createTranscriptionFromUpload(req.user!, {
+        buffer: file.buffer,
+        declaredMime: file.mimetype,
+        durationMs: Number.isFinite(durationMs as number) ? (durationMs as number) : null,
+        conversationId: typeof req.body?.conversationId === 'string' ? req.body.conversationId : undefined,
+        languageHint: typeof req.body?.language === 'string' ? req.body.language : undefined,
+      });
+      res.status(201).json({ success: true, ...result });
+    } catch (err) {
+      handleHttpError(err, res, 'Voice transcription failed.');
+    }
+  }
+);
+
+app.post(
+  '/api/ai/voice/auto',
+  authenticate,
+  authorize(['client']),
+  voiceUploadRateLimit,
+  (req, res, next) => {
+    voiceUpload.single('audio')(req, res, (err: any) => {
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: `Audio exceeds maximum size of ${MAX_AUDIO_BYTES} bytes.` });
+        }
+        return res.status(400).json({ error: err.message });
+      }
+      if (err) return res.status(400).json({ error: 'Audio upload failed.' });
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      const file = req.file;
+      if (!file?.buffer?.length) {
+        return res.status(400).json({ error: 'Audio file is required (field name: audio).' });
+      }
+      const durationRaw = req.body?.durationMs;
+      const durationMs = durationRaw != null && durationRaw !== '' ? Number(durationRaw) : null;
+      const result = await processVoiceMessageAuto(req.user!, {
+        buffer: file.buffer,
+        declaredMime: file.mimetype,
+        durationMs: Number.isFinite(durationMs as number) ? (durationMs as number) : null,
+        conversationId: typeof req.body?.conversationId === 'string' ? req.body.conversationId : undefined,
+        languageHint: typeof req.body?.language === 'string' ? req.body.language : undefined,
+        submissionKey: typeof req.body?.submissionKey === 'string' ? req.body.submissionKey : undefined,
+      });
+
+      if (!result.autoSent) {
+        return res.status(200).json({
+          success: true,
+          autoSent: false,
+          orderPlaced: false,
+          transcriptId: result.transcriptId,
+          conversationId: result.conversationId,
+          transcript: result.transcript,
+          detectedLanguage: result.detectedLanguage,
+          geminiUsed: result.geminiUsed,
+          transcriptionSucceeded: result.transcriptionSucceeded,
+          error: result.error,
+          errorCode: result.errorCode,
+          requiresManualEntry: true,
+        });
+      }
+
+      const chatResult = result as Extract<typeof result, { reply: string }>;
+      res.status(201).json({
+        success: true,
+        autoSent: true,
+        orderPlaced: false,
+        transcriptId: chatResult.transcriptId,
+        conversationId: chatResult.conversationId,
+        userText: chatResult.transcript,
+        reply: chatResult.reply,
+        detectedLanguage: chatResult.detectedLanguage,
+        suggestedProducts: chatResult.suggestedProducts,
+        cart: chatResult.cart,
+        needsConfirmation: chatResult.needsConfirmation,
+        clarificationNeeded: chatResult.clarificationNeeded,
+        messageId: chatResult.messageId,
+        toolCalls: chatResult.toolCalls,
+        geminiUsed: chatResult.geminiUsed,
+        geminiModel: chatResult.geminiModel,
+        fallbackReason: chatResult.fallbackReason,
+        action: chatResult.action,
+        transcriptionSucceeded: true,
+      });
+    } catch (err) {
+      handleHttpError(err, res, 'Voice message failed.');
+    }
+  }
+);
+
+app.post('/api/ai/voice/submit', authenticate, authorize(['client']), aiChatRateLimit, async (req, res) => {
+  try {
+    const result = await submitReviewedTranscript(req.user!, {
+      transcriptId: String(req.body.transcriptId || ''),
+      editedTranscript: String(req.body.editedTranscript || ''),
+      conversationId: typeof req.body.conversationId === 'string' ? req.body.conversationId : undefined,
+      language: typeof req.body.language === 'string' ? req.body.language : undefined,
+      submissionKey: String(req.body.submissionKey || ''),
+    });
+    if (result.alreadySubmitted || result.duplicate) {
+      return res.json({
+        success: true,
+        duplicate: true,
+        orderPlaced: false,
+        transcriptId: result.transcriptId,
+        conversationId: result.conversationId,
+        message: 'Transcript was already submitted. No duplicate AI action was taken.',
+      });
+    }
+    const chatResult = result as Extract<typeof result, { reply: string }>;
+    res.json({
+      success: true,
+      duplicate: false,
+      reply: chatResult.reply,
+      detectedLanguage: chatResult.detectedLanguage,
+      suggestedProducts: chatResult.suggestedProducts,
+      cart: chatResult.cart,
+      needsConfirmation: chatResult.needsConfirmation,
+      clarificationNeeded: chatResult.clarificationNeeded,
+      conversationId: chatResult.conversationId,
+      messageId: chatResult.messageId,
+      toolCalls: chatResult.toolCalls,
+      geminiUsed: chatResult.geminiUsed,
+      action: chatResult.action,
+      transcriptId: chatResult.transcriptId,
+      orderPlaced: false,
+      requiresCheckoutConfirmation: chatResult.requiresCheckoutConfirmation,
+    });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to submit reviewed transcript.');
+  }
+});
+
+app.post('/api/ai/voice/tts', authenticate, authorize(['client']), voiceTtsRateLimit, async (req, res) => {
+  try {
+    const text = typeof req.body.text === 'string' ? req.body.text : '';
+    if (!text.trim()) return res.status(400).json({ error: 'Text is required for speech.' });
+    const result = await synthesizeAssistantReply(req.user!, {
+      text,
+      language: typeof req.body.language === 'string' ? req.body.language : 'en',
+      conversationId: typeof req.body.conversationId === 'string' ? req.body.conversationId : undefined,
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    // TTS must never block ordering
+    res.json({
+      success: true,
+      ok: false,
+      orderPlaced: false,
+      fallbackReason: 'Voice playback unavailable. Text reply still works.',
+      nativeLanguageReliable: false,
+    });
+  }
+});
+
+app.get('/api/ai/voice/audio/:id', authenticate, authorize(['client']), async (req, res) => {
+  try {
+    const { asset, buffer } = await getOwnedAudio(req.user!, req.params.id);
+    res.setHeader('Content-Type', asset.mimeType);
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.send(buffer);
+  } catch (err) {
+    handleHttpError(err, res, 'Audio not found.');
   }
 });
 
 if (process.env.NODE_ENV !== 'production') {
   const vite = await createViteServer({
-    server: { middlewareMode: true, hmr: false }
+    server: { middlewareMode: true, hmr: false },
   });
   app.use(vite.middlewares);
 } else {
@@ -606,7 +750,24 @@ if (process.env.NODE_ENV !== 'production') {
   });
 }
 
-const PORT = 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Wholesale Market Platform running on http://localhost:${PORT}`);
-});
+const PORT = Number(process.env.PORT || 3000);
+
+async function start() {
+  try {
+    await runMigrations();
+    if (!isProduction()) {
+      await seedDevelopmentData();
+    }
+    const connected = await checkDatabaseConnection();
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Wholesale Market Platform running on http://localhost:${PORT}`);
+      console.log(`Database: ${connected ? 'connected' : 'disconnected'}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server. PostgreSQL must be configured before the demo can run.');
+    console.error(err);
+    process.exit(1);
+  }
+}
+
+await start();
