@@ -1,0 +1,6 @@
+{
+  "name": "Wholesale Market Platform",
+  "description": "Multi-Agent AI B2B Wholesale Marketplace connecting wholesalers, shopkeepers, admins, and delivery assignees with multilingual voice and chat support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
