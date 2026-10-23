@@ -4,7 +4,7 @@ import {
   MessageSquare, Mic, Volume2, CheckCircle2, XCircle,
   Clock, ArrowRight, DollarSign, RefreshCw, Send,
   FileText, Plus, ShieldCheck, MapPin, Sparkles, Check,
-  Square, Pause, X,
+  Square, Pause, X, ClipboardList,
 } from 'lucide-react';
 import { formatDuration, isMediaRecordingSupported, MAX_CLIENT_RECORD_MS, pickRecorderMimeType } from './voice/mediaSupport';
 import {
@@ -18,6 +18,23 @@ import {
   StockMeter,
   TabRail,
 } from './ui/system';
+import { ChatMessageMotion, FadeIn, Pressable, Stagger } from './motion/Motion';
+import { AmbientShell } from './motion/LivingBackdrop';
+import { AiAura, AiStateLabel, deriveAiVisualState } from './motion/AiAura';
+import { AiModeChip, MicOrb, TypingDots, WaveformBars } from './ui/chatChrome';
+import { HealthMeter, SparkBars } from './ui/charts';
+import {
+  bestSellersFromSubOrders,
+  frequentProductsFromOrders,
+  inventoryHealth,
+  lastOrderLines,
+  orderAmountSeries,
+} from './insights/derive';
+import { LandingPage, type ApplyForm, type LandingAction } from './landing/LandingPage';
+import { BrandLoader, SoftProgress } from './ux/BrandLoader';
+import { OfflineScreen, useConnectivity } from './ux/connectivity';
+import { ContentReveal } from './ux/skeletons';
+import { friendlyNetworkMessage, safeFetch } from './ux/safeFetch';
 
 interface Wholesaler {
   id: string;
@@ -134,18 +151,26 @@ interface ChatMessage {
   retryText?: string;
   ttsNote?: string;
   timestamp: string;
+  geminiUsed?: boolean;
+  fallbackReason?: string;
 }
 
 type VoiceUiState = 'idle' | 'recording' | 'preview' | 'transcribing' | 'review' | 'submitting';
 
 export default function App() {
+  const connectivity = useConnectivity();
   const [navState, setNavState] = useState<string>('gateway');
+  const [bootFailed, setBootFailed] = useState(false);
 
   // Client Auth
   const [clientAuthMode, setClientAuthMode] = useState<'signin' | 'signup'>('signin');
-  const [clientSignupForm, setClientSignupForm] = useState({ name: '', storeName: '', phone: '' });
-  const [clientSigninPhone, setClientSigninPhone] = useState('');
-  const [currentClient, setCurrentClient] = useState<{ id: string; name: string; storeName: string; phone: string } | null>(null);
+  const [clientSignupForm, setClientSignupForm] = useState({ name: '', storeName: '', phone: '', email: '', password: '' });
+  const [clientSigninPhone, setClientSigninPhone] = useState('03009876543');
+  const [clientSigninPassword, setClientSigninPassword] = useState('password123');
+  const [currentClient, setCurrentClient] = useState<{ id: string; name: string; storeName: string; phone: string; email?: string | null } | null>(null);
+  const [forgotIdentity, setForgotIdentity] = useState({ email: '', phone: '' });
+  const [resetPasswordForm, setResetPasswordForm] = useState({ token: '', newPassword: '', confirm: '' });
+  const [authInfo, setAuthInfo] = useState('');
 
   // Wholesaler Auth
   const [wholesalerEmail, setWholesalerEmail] = useState('wholesaler1@market.pk');
@@ -206,9 +231,34 @@ export default function App() {
   const [productBusy, setProductBusy] = useState(false);
 
   // Admin Tabs & New Wholesaler Modal
-  const [adminTab, setAdminTab] = useState<'overview' | 'wholesalers' | 'dispatch' | 'audit' | 'all_orders'>('overview');
+  const [adminTab, setAdminTab] = useState<'overview' | 'wholesalers' | 'applications' | 'dispatch' | 'audit' | 'all_orders'>('overview');
   const [showAddWholesalerModal, setShowAddWholesalerModal] = useState(false);
   const [newWholesalerForm, setNewWholesalerForm] = useState({ name: '', category: 'Grains & Flour', city: 'Peshawar', ownerEmail: '', phone: '', password: 'password123' });
+  const [wholesalerApplications, setWholesalerApplications] = useState<
+    {
+      id: string;
+      businessName: string;
+      applicantName: string;
+      email: string;
+      phone: string;
+      location: string;
+      description: string;
+      category: string;
+      status: string;
+      rejectReason?: string | null;
+      wholesalerId?: string | null;
+      createdAt: string;
+      reviewedAt?: string | null;
+    }[]
+  >([]);
+  const [applicationBusyId, setApplicationBusyId] = useState('');
+  const [rejectReasonDraft, setRejectReasonDraft] = useState<Record<string, string>>({});
+
+  // Public wholesaler application (landing)
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [applyBusy, setApplyBusy] = useState(false);
+  const [applyError, setApplyError] = useState('');
+  const [applySuccess, setApplySuccess] = useState('');
 
   // AI Chat State
   const [chatLanguage, setChatLanguage] = useState<'en' | 'ur' | 'ps'>('ur');
@@ -217,11 +267,13 @@ export default function App() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([
     {
       sender: 'ai',
-      text: 'السلام علیکم! Welcome to Peshawar General Store & Drinks Wholesale Hub. Ask in English, اردو, پښتو, or Roman Urdu — I search live stock and update your cart (orders still need your checkout confirmation).',
+      text: 'السلام علیکم! Welcome to Peshawar Wholesale. Ask in English, اردو, پښتو, or Roman Urdu — I search live stock and update your cart. Checkout still needs your explicit confirmation.',
       language: 'ur',
-      timestamp: new Date().toLocaleTimeString()
+      timestamp: new Date().toLocaleTimeString(),
+      geminiUsed: undefined,
     }
   ]);
+  const [aiStatus, setAiStatus] = useState<{ geminiConfigured?: boolean; mode?: string } | null>(null);
   const [isAiLoading, setIsAiLoading] = useState<boolean>(false);
   const [chatError, setChatError] = useState('');
   const chatScrollRef = useRef<HTMLDivElement>(null);
@@ -265,10 +317,24 @@ export default function App() {
     chatLanguageRef.current = chatLanguage;
   }, [chatLanguage]);
 
-  const storeAuthToken = (token?: string) => {
+  const AUTH_SESSION_KEY = 'pgsw_auth_session_v1';
+
+  const storeAuthToken = (token?: string, meta?: { role?: string; portal?: string }) => {
     const value = token || '';
     authTokenRef.current = value;
     setAuthToken(value);
+    try {
+      if (!value) {
+        sessionStorage.removeItem(AUTH_SESSION_KEY);
+      } else {
+        sessionStorage.setItem(
+          AUTH_SESSION_KEY,
+          JSON.stringify({ token: value, role: meta?.role || '', portal: meta?.portal || '', savedAt: Date.now() })
+        );
+      }
+    } catch {
+      /* sessionStorage may be unavailable */
+    }
   };
 
   const authHeaders = (json = true): HeadersInit => {
@@ -278,12 +344,36 @@ export default function App() {
     return headers;
   };
 
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const resetToken = params.get('resetToken');
+      if (resetToken) {
+        setResetPasswordForm((f) => ({ ...f, token: resetToken }));
+        setNavState('password_reset');
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+      const raw = sessionStorage.getItem(AUTH_SESSION_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed?.token || Date.now() - Number(parsed.savedAt || 0) > 12 * 60 * 60 * 1000) {
+        sessionStorage.removeItem(AUTH_SESSION_KEY);
+        return;
+      }
+      authTokenRef.current = parsed.token;
+      setAuthToken(parsed.token);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const handleLogout = () => {
     storeAuthToken('');
     setCurrentClient(null);
     setCurrentWholesaler(null);
     setCurrentDelivery(null);
     setIsAdminLoggedIn(false);
+    setAuthInfo('');
     setCart({});
     setCartSubtotal(0);
     setCheckoutError('');
@@ -318,7 +408,11 @@ export default function App() {
 
   const fetchData = async () => {
     try {
-      const res = await fetch('/api/market/data', { headers: authHeaders(false) });
+      const res = await safeFetch('/api/market/data', {
+        headers: authHeaders(false),
+        retry: 1,
+        timeoutMs: 20_000,
+      });
       const data = await res.json();
       setWholesalers(data.wholesalers || []);
       setProducts(data.products || []);
@@ -328,9 +422,12 @@ export default function App() {
       setPayments(data.payments || []);
       setAuditEvents(data.auditEvents || []);
       applyCartPayload(data.cart);
+      setBootFailed(false);
       setLoading(false);
     } catch (err) {
       console.error('Failed to fetch data', err);
+      setBootFailed(true);
+      setActionError(friendlyNetworkMessage(err, 'Unable to load live market data.'));
       setLoading(false);
     }
   };
@@ -340,17 +437,73 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const onReconnect = () => {
+      void fetchData();
+    };
+    window.addEventListener('wholesale:reconnected', onReconnect);
+    return () => window.removeEventListener('wholesale:reconnected', onReconnect);
+  }, []);
+
+  useEffect(() => {
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
   }, [chatHistory]);
 
+  const fetchAiStatus = async (token?: string) => {
+    try {
+      const res = await fetch('/api/ai/status', {
+        headers: { Authorization: `Bearer ${token || authTokenRef.current}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setAiStatus({ geminiConfigured: data.geminiConfigured, mode: data.mode });
+    } catch {
+      // ignore — chat still works
+    }
+  };
+
+  const reorderLastOrder = async () => {
+    const last = lastOrderLines(orders as any);
+    if (!last?.lines.length) {
+      setActionError('No previous order lines to reorder yet.');
+      return;
+    }
+    setCartBusy(true);
+    setActionError('');
+    try {
+      for (const line of last.lines) {
+        const product = products.find((p) => p.id === line.productId);
+        const qty = Math.max(line.quantity, product?.moq || 1);
+        const res = await fetch('/api/cart/items', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ productId: line.productId, quantity: qty }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Could not add ${line.name}`);
+        applyCartPayload(data.cart);
+      }
+      await fetchData();
+      setCheckoutModal(true);
+    } catch (err: any) {
+      setActionError(err?.message || 'Reorder failed.');
+    } finally {
+      setCartBusy(false);
+    }
+  };
+
   // Auth Handlers
   const handleClientSignup = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
-    if (!clientSignupForm.name || !clientSignupForm.storeName || !clientSignupForm.phone) {
-      setAuthError('Please enter exact Name, Store Name, and Phone Number.');
+    setAuthInfo('');
+    if (!clientSignupForm.name || !clientSignupForm.storeName || !clientSignupForm.phone || !clientSignupForm.password) {
+      setAuthError('Name, store, phone, and password (min 8 characters) are required.');
+      return;
+    }
+    if (clientSignupForm.password.length < 8) {
+      setAuthError('Password must be at least 8 characters.');
       return;
     }
     try {
@@ -361,10 +514,11 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        storeAuthToken(data.token);
+        storeAuthToken(data.token, { role: 'client', portal: 'client_portal' });
         setCurrentClient(data.client);
         setNavState('client_portal');
         fetchData();
+        fetchAiStatus(data.token);
         loadConversationHistory(data.token);
       } else {
         setAuthError(data.error || 'Signup failed.');
@@ -377,28 +531,85 @@ export default function App() {
   const handleClientSignin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
-    if (!clientSigninPhone) {
-      setAuthError('Please enter your phone number.');
+    setAuthInfo('');
+    if (!clientSigninPhone || !clientSigninPassword) {
+      setAuthError('Enter your phone number and password.');
       return;
     }
     try {
       const res = await fetch('/api/auth/client/signin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone: clientSigninPhone })
+        body: JSON.stringify({ phone: clientSigninPhone, password: clientSigninPassword })
       });
       const data = await res.json();
       if (data.success) {
-        storeAuthToken(data.token);
+        storeAuthToken(data.token, { role: 'client', portal: 'client_portal' });
         setCurrentClient(data.client);
         setNavState('client_portal');
         fetchData();
+        fetchAiStatus(data.token);
         loadConversationHistory(data.token);
       } else {
-        setAuthError(data.error || 'Client not found.');
+        setAuthError(data.error || 'Invalid credentials.');
       }
     } catch (err) {
       setAuthError('Sign in failed.');
+    }
+  };
+
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthInfo('');
+    try {
+      const res = await fetch('/api/auth/password/forgot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: forgotIdentity.email || undefined,
+          phone: forgotIdentity.phone || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || 'Unable to process request.');
+        return;
+      }
+      setAuthInfo(data.message || 'If an account exists, a reset link has been queued.');
+    } catch {
+      setAuthError('Network error.');
+    }
+  };
+
+  const handlePasswordResetSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthInfo('');
+    if (resetPasswordForm.newPassword.length < 8) {
+      setAuthError('Password must be at least 8 characters.');
+      return;
+    }
+    if (resetPasswordForm.newPassword !== resetPasswordForm.confirm) {
+      setAuthError('Passwords do not match.');
+      return;
+    }
+    try {
+      const res = await fetch('/api/auth/password/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: resetPasswordForm.token, newPassword: resetPasswordForm.newPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || 'Unable to reset password.');
+        return;
+      }
+      setAuthInfo('Password updated. You can sign in now.');
+      setNavState('client_auth');
+      setClientAuthMode('signin');
+    } catch {
+      setAuthError('Network error.');
     }
   };
 
@@ -413,15 +624,15 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        storeAuthToken(data.token);
+        storeAuthToken(data.token, { role: 'wholesaler', portal: 'wholesaler_portal' });
         setCurrentWholesaler(data.wholesaler);
         setNavState('wholesaler_portal');
         fetchData();
       } else {
-        setAuthError(data.error || 'Wrong email or password.');
+        setAuthError(data.error || 'Invalid credentials.');
       }
     } catch (err) {
-      setAuthError('Wrong password or email.');
+      setAuthError('Invalid credentials.');
     }
   };
 
@@ -436,15 +647,16 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        storeAuthToken(data.token);
+        storeAuthToken(data.token, { role: 'admin', portal: 'admin_portal' });
         setIsAdminLoggedIn(true);
         setNavState('admin_portal');
         fetchData();
+        fetchWholesalerApplications();
       } else {
-        setAuthError(data.error || 'Wrong admin email or password.');
+        setAuthError(data.error || 'Invalid credentials.');
       }
     } catch (err) {
-      setAuthError('Wrong admin email or password.');
+      setAuthError('Invalid credentials.');
     }
   };
 
@@ -459,15 +671,15 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        storeAuthToken(data.token);
+        storeAuthToken(data.token, { role: 'delivery', portal: 'delivery_portal' });
         setCurrentDelivery(data.delivery);
         setNavState('delivery_portal');
         fetchData();
       } else {
-        setAuthError(data.error || 'Wrong delivery email or password.');
+        setAuthError(data.error || 'Invalid credentials.');
       }
     } catch {
-      setAuthError('Delivery sign in failed.');
+      setAuthError('Invalid credentials.');
     }
   };
 
@@ -731,6 +943,8 @@ export default function App() {
         cartPreview,
         needsConfirmation: Boolean(data.needsConfirmation),
         audioPlayable: true,
+        geminiUsed: Boolean(data.geminiUsed),
+        fallbackReason: data.fallbackReason,
         ttsNote: data.fallbackReason || (data.geminiUsed ? undefined : 'Deterministic agents (Gemini unavailable).'),
         timestamp: new Date().toLocaleTimeString(),
       },
@@ -1255,156 +1469,244 @@ export default function App() {
     }
   };
 
+  const fetchWholesalerApplications = async () => {
+    try {
+      const res = await fetch('/api/wholesaler-applications', { headers: authHeaders() });
+      const data = await res.json();
+      if (data.success) setWholesalerApplications(data.applications || []);
+    } catch (err) {
+      console.error('Applications fetch error', err);
+    }
+  };
+
+  const handleLandingAction = (action: LandingAction) => {
+    setApplyError('');
+    if (action === 'apply') {
+      setApplyOpen(true);
+      setApplySuccess('');
+      return;
+    }
+    if (action === 'shopkeeper_signin') {
+      setClientAuthMode('signin');
+      setNavState('client_auth');
+      return;
+    }
+    if (action === 'shopkeeper_signup') {
+      setClientAuthMode('signup');
+      setNavState('client_auth');
+      return;
+    }
+    if (action === 'wholesaler_signin') {
+      setNavState('wholesaler_auth');
+      return;
+    }
+    if (action === 'delivery_signin') {
+      setNavState('delivery_auth');
+      return;
+    }
+    if (action === 'admin_signin') {
+      setNavState('admin_auth');
+    }
+  };
+
+  const handleSubmitWholesalerApplication = async (form: ApplyForm) => {
+    setApplyBusy(true);
+    setApplyError('');
+    setApplySuccess('');
+    try {
+      const res = await fetch('/api/wholesaler-applications', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setApplyError(data.error || 'Unable to submit application.');
+        return;
+      }
+      setApplySuccess(data.message || 'Application submitted. We will email you after review.');
+    } catch {
+      setApplyError('Network error. Please try again.');
+    } finally {
+      setApplyBusy(false);
+    }
+  };
+
+  const approveApplication = async (id: string) => {
+    setApplicationBusyId(id);
+    setActionError('');
+    try {
+      const res = await fetch(`/api/wholesaler-applications/${id}/approve`, {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Approval failed.');
+        return;
+      }
+      await Promise.all([fetchWholesalerApplications(), fetchData()]);
+    } catch {
+      setActionError('Approval failed.');
+    } finally {
+      setApplicationBusyId('');
+    }
+  };
+
+  const rejectApplication = async (id: string) => {
+    setApplicationBusyId(id);
+    setActionError('');
+    try {
+      const res = await fetch(`/api/wholesaler-applications/${id}/reject`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ reason: rejectReasonDraft[id] || '' }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setActionError(data.error || 'Rejection failed.');
+        return;
+      }
+      await fetchWholesalerApplications();
+    } catch {
+      setActionError('Rejection failed.');
+    } finally {
+      setApplicationBusyId('');
+    }
+  };
+
   if (loading) {
+    return <BrandLoader title="Loading wholesale platform…" subtitle="Preparing secure portals and live catalog" />;
+  }
+
+  if (!connectivity.browserOnline && navState !== 'gateway') {
     return (
-      <div className="min-h-screen bg-brand flex items-center justify-center text-canvas">
-        <div className="text-center space-y-4 px-6">
-          <RefreshCw className="w-9 h-9 animate-spin mx-auto text-accent" />
-          <p className="text-lg font-serif font-semibold tracking-tight">Loading wholesale platform…</p>
-          <p className="text-xs text-accent/80">Connecting secure portals and live catalog</p>
-        </div>
-      </div>
+      <OfflineScreen
+        reason="offline"
+        onRetry={() => void connectivity.refreshConnectivity()}
+        onHome={() => setNavState('gateway')}
+      />
+    );
+  }
+
+  if (bootFailed && connectivity.backendReachable === false && navState !== 'gateway') {
+    return (
+      <OfflineScreen
+        reason="backend"
+        onRetry={() => {
+          void connectivity.refreshConnectivity();
+          setLoading(true);
+          void fetchData();
+        }}
+        onHome={() => setNavState('gateway')}
+      />
     );
   }
 
   // ================= 1. GATEWAY HOMEPAGE =================
   if (navState === 'gateway') {
     return (
-      <div className="app-shell">
-        <header className="portal-header !static">
-          <div className="max-w-7xl w-full mx-auto flex items-center justify-between gap-4 px-1">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="portal-brand-mark !w-12 !h-12 !rounded-2xl">
-                <Store className="w-6 h-6" />
-              </div>
-              <div className="min-w-0">
-                <h1 className="font-serif font-bold text-lg sm:text-xl tracking-tight truncate">Peshawar General Store & Drinks Wholesale</h1>
-                <p className="text-[10px] sm:text-xs text-accent tracking-[0.18em] uppercase">B2B wholesale · AI ordering · live stock</p>
-              </div>
-            </div>
-            <div className="hidden lg:flex items-center gap-4 text-xs text-canvas/75 font-medium">
-              <span>Shopkeepers</span>
-              <span className="text-accent">·</span>
-              <span>Wholesalers</span>
-              <span className="text-accent">·</span>
-              <span>Dispatch</span>
-            </div>
-          </div>
-        </header>
-
-        <section className="gateway-hero px-5 sm:px-8 py-14 sm:py-20">
-          <div className="max-w-4xl mx-auto relative z-10 text-center space-y-5">
-            <p className="inline-flex items-center gap-2 rounded-full border border-accent/35 bg-black/20 px-3.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">
-              Peshawar distribution network
-            </p>
-            <h2 className="font-serif font-bold text-3xl sm:text-5xl leading-[1.12] tracking-tight">
-              Wholesale commerce with multilingual AI for every storefront
-            </h2>
-            <p className="text-sm sm:text-base text-canvas/90 max-w-2xl mx-auto leading-relaxed">
-              Order drinks and groceries from isolated wholesaler tenants, confirm checkout yourself, and track delivery through one polished operating system.
-            </p>
-          </div>
-        </section>
-
-        <section className="portal-main !max-w-6xl -mt-8 sm:-mt-10 relative z-20 pb-12">
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 sm:gap-5">
-            <article className="gateway-card">
-              <div className="space-y-3">
-                <div className="h-36 rounded-xl overflow-hidden bg-canvas">
-                  <img src="https://images.unsplash.com/photo-1534723452862-4c874018d66d?auto=format&fit=crop&w=800&q=80" alt="Shopkeeper ordering drinks" className="w-full h-full object-cover" />
-                </div>
-                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
-                  <ShoppingCart className="w-5 h-5" />
-                </div>
-                <h3 className="text-xl font-serif font-bold text-brand">Shopkeeper</h3>
-                <p className="text-sm text-muted leading-relaxed">AI chat & voice, live catalog, cart, and explicit checkout confirmation.</p>
-              </div>
-              <div className="flex gap-2 pt-2 border-t border-line">
-                <button type="button" onClick={() => { setClientAuthMode('signin'); setNavState('client_auth'); }} className="btn btn-primary flex-1">Sign in</button>
-                <button type="button" onClick={() => { setClientAuthMode('signup'); setNavState('client_auth'); }} className="btn btn-accent flex-1">Sign up</button>
-              </div>
-            </article>
-
-            <article className="gateway-card">
-              <div className="space-y-3">
-                <div className="h-36 rounded-xl overflow-hidden bg-canvas">
-                  <img src="https://images.unsplash.com/photo-1588964895597-cfccd6e2dbf9?auto=format&fit=crop&w=800&q=80" alt="Wholesale inventory" className="w-full h-full object-cover" />
-                </div>
-                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
-                  <Package className="w-5 h-5" />
-                </div>
-                <h3 className="text-xl font-serif font-bold text-brand">Wholesaler</h3>
-                <p className="text-sm text-muted leading-relaxed">Tenant catalog, stock, profit KPIs, and suborder approve/reject.</p>
-              </div>
-              <button type="button" onClick={() => setNavState('wholesaler_auth')} className="btn btn-primary w-full">
-                Sign in <ArrowRight className="w-4 h-4 text-accent" />
-              </button>
-            </article>
-
-            <article className="gateway-card">
-              <div className="space-y-3">
-                <div className="h-36 rounded-xl overflow-hidden bg-canvas">
-                  <img src="https://images.unsplash.com/photo-1586528116311-ad8dd3c8310d?auto=format&fit=crop&w=800&q=80" alt="Operations hub" className="w-full h-full object-cover" />
-                </div>
-                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
-                  <ShieldCheck className="w-5 h-5" />
-                </div>
-                <h3 className="text-xl font-serif font-bold text-brand">Admin</h3>
-                <p className="text-sm text-muted leading-relaxed">Tenants, dispatch queue, payments, and immutable audit trail.</p>
-              </div>
-              <button type="button" onClick={() => setNavState('admin_auth')} className="btn btn-primary w-full">
-                Sign in <ArrowRight className="w-4 h-4 text-accent" />
-              </button>
-            </article>
-
-            <article className="gateway-card">
-              <div className="space-y-3">
-                <div className="h-36 rounded-xl overflow-hidden bg-canvas grid place-items-center">
-                  <Truck className="w-14 h-14 text-accent" />
-                </div>
-                <div className="w-10 h-10 rounded-xl bg-brand text-accent grid place-items-center">
-                  <Truck className="w-5 h-5" />
-                </div>
-                <h3 className="text-xl font-serif font-bold text-brand">Delivery</h3>
-                <p className="text-sm text-muted leading-relaxed">Mobile-first run sheet with clear dispatch → deliver actions.</p>
-              </div>
-              <button type="button" onClick={() => setNavState('delivery_auth')} className="btn btn-primary w-full">
-                Sign in <ArrowRight className="w-4 h-4 text-accent" />
-              </button>
-            </article>
-          </div>
-        </section>
-
-        <footer className="mt-auto bg-brand-deep text-canvas/85 py-6 px-6 text-center text-xs border-t border-accent/20">
-          <p className="font-serif">© 2026 Peshawar General Store & Drinks Wholesale</p>
-        </footer>
-      </div>
+      <ContentReveal>
+        <LandingPage
+          onAction={handleLandingAction}
+          applyOpen={applyOpen}
+          onCloseApply={() => {
+            setApplyOpen(false);
+            setApplyError('');
+          }}
+          onSubmitApply={handleSubmitWholesalerApplication}
+          applyBusy={applyBusy}
+          applyError={applyError}
+          applySuccess={applySuccess}
+        />
+      </ContentReveal>
     );
   }
 
   // ================= 2. CLIENT AUTH =================
+  if (navState === 'password_forgot') {
+    return (
+      <AuthLayout
+        icon={ShieldCheck}
+        title="Forgot password"
+        subtitle="Enter the email or phone on your account. If we find a match with a notification email, a single-use reset link is queued."
+        error={authError}
+        onBack={() => setNavState('client_auth')}
+        footer={<p className="text-[11px] text-muted text-center">Demo shopkeeper email: babar@market.pk</p>}
+      >
+        {authInfo && <div className="alert alert-info text-xs">{authInfo}</div>}
+        <form onSubmit={handleForgotPassword} className="space-y-3.5">
+          <div>
+            <label className="field-label">Email</label>
+            <input type="email" value={forgotIdentity.email} onChange={(e) => setForgotIdentity({ ...forgotIdentity, email: e.target.value })} className="field" placeholder="you@store.pk" />
+          </div>
+          <div>
+            <label className="field-label">Or phone</label>
+            <input type="text" value={forgotIdentity.phone} onChange={(e) => setForgotIdentity({ ...forgotIdentity, phone: e.target.value })} className="field" placeholder="03009876543" />
+          </div>
+          <button type="submit" className="btn btn-primary btn-lg w-full">Send reset link</button>
+        </form>
+      </AuthLayout>
+    );
+  }
+
+  if (navState === 'password_reset') {
+    return (
+      <AuthLayout
+        icon={ShieldCheck}
+        title="Choose a new password"
+        subtitle="Paste your reset token if needed, then set a password of at least 8 characters."
+        error={authError}
+        onBack={() => setNavState('client_auth')}
+      >
+        {authInfo && <div className="alert alert-info text-xs">{authInfo}</div>}
+        <form onSubmit={handlePasswordResetSubmit} className="space-y-3.5">
+          <div>
+            <label className="field-label">Reset token</label>
+            <input required value={resetPasswordForm.token} onChange={(e) => setResetPasswordForm({ ...resetPasswordForm, token: e.target.value })} className="field font-mono text-xs" />
+          </div>
+          <div>
+            <label className="field-label">New password</label>
+            <input type="password" required minLength={8} value={resetPasswordForm.newPassword} onChange={(e) => setResetPasswordForm({ ...resetPasswordForm, newPassword: e.target.value })} className="field" />
+          </div>
+          <div>
+            <label className="field-label">Confirm password</label>
+            <input type="password" required minLength={8} value={resetPasswordForm.confirm} onChange={(e) => setResetPasswordForm({ ...resetPasswordForm, confirm: e.target.value })} className="field" />
+          </div>
+          <button type="submit" className="btn btn-accent btn-lg w-full">Update password</button>
+        </form>
+      </AuthLayout>
+    );
+  }
+
   if (navState === 'client_auth') {
     return (
       <AuthLayout
         icon={Store}
         title={clientAuthMode === 'signin' ? 'Shopkeeper sign in' : 'Register your store'}
-        subtitle={clientAuthMode === 'signin' ? 'Use your registered phone to open the ordering portal.' : 'Provide your name, store name, and phone number.'}
+        subtitle={clientAuthMode === 'signin' ? 'Phone + password. Checkout and AI stay behind your account.' : 'Create a store account with a password. Email is optional but required for password reset emails.'}
         error={authError}
         onBack={() => setNavState('gateway')}
         footer={
           <div className="space-y-3 text-center">
-            <p className="text-[11px] text-muted">Demo phone: 03009876543 · Babar General Store</p>
+            <p className="text-[11px] text-muted">Demo: 03009876543 / password123 · babar@market.pk</p>
+            {clientAuthMode === 'signin' && (
+              <button type="button" onClick={() => { setNavState('password_forgot'); setAuthError(''); setAuthInfo(''); }} className="text-xs font-semibold text-accent hover:underline block w-full">
+                Forgot password?
+              </button>
+            )}
             <button type="button" onClick={() => { setClientAuthMode(clientAuthMode === 'signin' ? 'signup' : 'signin'); setAuthError(''); }} className="text-xs font-semibold text-accent hover:underline">
               {clientAuthMode === 'signin' ? "Don't have an account? Sign up" : 'Already registered? Sign in'}
             </button>
           </div>
         }
       >
+        {authInfo && <div className="alert alert-info text-xs">{authInfo}</div>}
         {clientAuthMode === 'signup' ? (
           <form onSubmit={handleClientSignup} className="space-y-3.5">
             <div>
               <label className="field-label">Full name</label>
-              <input type="text" required value={clientSignupForm.name} onChange={e => setClientSignupForm({ ...clientSignupForm, name: e.target.value })} placeholder="e.g. Babar Khan" className="field" />
+              <input type="text" required value={clientSignupForm.name} onChange={e => setClientSignupForm({ ...clientSignupForm, name: e.target.value })} placeholder="e.g. Babar Khan" className="field" autoComplete="name" />
             </div>
             <div>
               <label className="field-label">Store name</label>
@@ -1412,7 +1714,15 @@ export default function App() {
             </div>
             <div>
               <label className="field-label">Phone number</label>
-              <input type="text" required value={clientSignupForm.phone} onChange={e => setClientSignupForm({ ...clientSignupForm, phone: e.target.value })} placeholder="e.g. 03009876543" className="field" />
+              <input type="text" required value={clientSignupForm.phone} onChange={e => setClientSignupForm({ ...clientSignupForm, phone: e.target.value })} placeholder="e.g. 03009876543" className="field" autoComplete="tel" />
+            </div>
+            <div>
+              <label className="field-label">Email <span className="text-muted font-normal">(for notifications)</span></label>
+              <input type="email" value={clientSignupForm.email} onChange={e => setClientSignupForm({ ...clientSignupForm, email: e.target.value })} placeholder="optional@store.pk" className="field" autoComplete="email" />
+            </div>
+            <div>
+              <label className="field-label">Password</label>
+              <input type="password" required minLength={8} value={clientSignupForm.password} onChange={e => setClientSignupForm({ ...clientSignupForm, password: e.target.value })} className="field" autoComplete="new-password" />
             </div>
             <button type="submit" className="btn btn-primary btn-lg w-full">Create account</button>
           </form>
@@ -1420,7 +1730,11 @@ export default function App() {
           <form onSubmit={handleClientSignin} className="space-y-3.5">
             <div>
               <label className="field-label">Phone number</label>
-              <input type="text" required value={clientSigninPhone} onChange={e => setClientSigninPhone(e.target.value)} placeholder="e.g. 03009876543" className="field" />
+              <input type="text" required value={clientSigninPhone} onChange={e => setClientSigninPhone(e.target.value)} placeholder="e.g. 03009876543" className="field" autoComplete="username" />
+            </div>
+            <div>
+              <label className="field-label">Password</label>
+              <input type="password" required value={clientSigninPassword} onChange={e => setClientSigninPassword(e.target.value)} className="field" autoComplete="current-password" />
             </div>
             <button type="submit" className="btn btn-primary btn-lg w-full">Enter shopkeeper portal</button>
           </form>
@@ -1438,16 +1752,21 @@ export default function App() {
         subtitle="Tenant email and password for your isolated catalog."
         error={authError}
         onBack={() => setNavState('gateway')}
-        footer={<p className="text-[11px] text-muted text-center">Demo: wholesaler1@market.pk / password123</p>}
+        footer={
+          <div className="space-y-2 text-center">
+            <p className="text-[11px] text-muted">Demo: wholesaler1@market.pk / password123</p>
+            <button type="button" className="text-xs font-semibold text-accent hover:underline" onClick={() => { setForgotIdentity({ email: wholesalerEmail, phone: '' }); setNavState('password_forgot'); }}>Forgot password?</button>
+          </div>
+        }
       >
         <form onSubmit={handleWholesalerSignin} className="space-y-3.5">
           <div>
             <label className="field-label">Email</label>
-            <input type="email" required value={wholesalerEmail} onChange={e => setWholesalerEmail(e.target.value)} className="field" />
+            <input type="email" required value={wholesalerEmail} onChange={e => setWholesalerEmail(e.target.value)} className="field" autoComplete="username" />
           </div>
           <div>
             <label className="field-label">Password</label>
-            <input type="password" required value={wholesalerPassword} onChange={e => setWholesalerPassword(e.target.value)} className="field" />
+            <input type="password" required value={wholesalerPassword} onChange={e => setWholesalerPassword(e.target.value)} className="field" autoComplete="current-password" />
           </div>
           <button type="submit" className="btn btn-primary btn-lg w-full">Enter tenant portal</button>
         </form>
@@ -1464,16 +1783,21 @@ export default function App() {
         subtitle="Platform governance credentials."
         error={authError}
         onBack={() => setNavState('gateway')}
-        footer={<p className="text-[11px] text-muted text-center">Demo: admin@market.pk / admin123</p>}
+        footer={
+          <div className="space-y-2 text-center">
+            <p className="text-[11px] text-muted">Demo: admin@market.pk / admin123</p>
+            <button type="button" className="text-xs font-semibold text-accent hover:underline" onClick={() => { setForgotIdentity({ email: adminEmail, phone: '' }); setNavState('password_forgot'); }}>Forgot password?</button>
+          </div>
+        }
       >
         <form onSubmit={handleAdminSignin} className="space-y-3.5">
           <div>
             <label className="field-label">Admin email</label>
-            <input type="email" required value={adminEmail} onChange={e => setAdminEmail(e.target.value)} className="field" />
+            <input type="email" required value={adminEmail} onChange={e => setAdminEmail(e.target.value)} className="field" autoComplete="username" />
           </div>
           <div>
             <label className="field-label">Password</label>
-            <input type="password" required value={adminPassword} onChange={e => setAdminPassword(e.target.value)} className="field" />
+            <input type="password" required value={adminPassword} onChange={e => setAdminPassword(e.target.value)} className="field" autoComplete="current-password" />
           </div>
           <button type="submit" className="btn btn-primary btn-lg w-full">Enter control hub</button>
         </form>
@@ -1509,97 +1833,171 @@ export default function App() {
 
   // ================= 4c. DELIVERY PORTAL =================
   if (navState === 'delivery_portal') {
+    const pipeline = ['Assigned', 'Dispatched', 'InTransit', 'Delivered'] as const;
     const nextAction = (status: string) => {
       if (status === 'Assigned') return { status: 'Dispatched', label: 'Mark dispatched' };
       if (status === 'Dispatched') return { status: 'InTransit', label: 'Mark in transit' };
       if (status === 'InTransit') return { status: 'Delivered', label: 'Confirm delivered' };
       return null;
     };
+    const activeRuns = shipments.filter((s) => !['Delivered', 'Failed', 'Cancelled'].includes(s.status));
+    const failedRuns = shipments.filter((s) => s.status === 'Failed');
     return (
-      <div className="app-shell">
+      <AmbientShell intensity="delivery" className="app-shell !bg-transparent">
         <PortalHeader
           icon={Truck}
           title={`${currentDelivery?.name || 'Courier'} · Assigned runs`}
           subtitle="Mobile delivery workspace"
           onLogout={handleLogout}
         />
-        <div className="portal-main !max-w-3xl space-y-3">
+        <div className="portal-main !max-w-3xl space-y-4">
+          <FadeIn>
+            <div className="grid grid-cols-2 gap-3">
+              <KpiCard label="Active runs" value={activeRuns.length} tone="accent" />
+              <KpiCard label="Exceptions" value={failedRuns.length} tone={failedRuns.length ? 'muted' : 'success'} />
+            </div>
+          </FadeIn>
           <AlertBanner>{actionError}</AlertBanner>
           {shipments.length === 0 && (
             <div className="surface-card">
               <EmptyState icon={Truck} title="No assigned deliveries" description="When dispatch assigns a run, it will appear here with large action buttons." />
             </div>
           )}
-          {shipments.map((shp) => {
-            const action = nextAction(shp.status);
-            return (
-              <article key={shp.id} className="surface-card p-4 sm:p-5 space-y-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0 space-y-1.5">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-serif font-bold text-brand text-base">{shp.id}</span>
-                      <StatusBadge status={shp.status} />
+          <Stagger className="space-y-3">
+            {shipments.map((shp) => {
+              const action = nextAction(shp.status);
+              const stepIdx = pipeline.indexOf(shp.status as (typeof pipeline)[number]);
+              return (
+                <article key={shp.id} className="surface-card p-4 sm:p-5 space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-serif font-bold text-brand text-base">{shp.id}</span>
+                        <StatusBadge status={shp.status} />
+                      </div>
+                      <p className="text-sm font-semibold text-brand">{shp.clientName || 'Shopkeeper'}</p>
+                      <p className="text-xs text-muted flex items-start gap-1.5">
+                        <MapPin className="w-3.5 h-3.5 mt-0.5 shrink-0 text-accent" />
+                        <span>{shp.deliveryAddress || 'Address on order'}</span>
+                      </p>
+                      <p className="text-[11px] text-muted">Order {shp.orderId}</p>
+                      {shp.failureReason && <p className="text-xs text-danger">Failure: {shp.failureReason}</p>}
                     </div>
-                    <p className="text-sm font-semibold text-brand">{shp.clientName || 'Shopkeeper'}</p>
-                    <p className="text-xs text-muted flex items-start gap-1.5">
-                      <MapPin className="w-3.5 h-3.5 mt-0.5 shrink-0 text-accent" />
-                      <span>{shp.deliveryAddress || 'Address on order'}</span>
-                    </p>
-                    <p className="text-[11px] text-muted">Order {shp.orderId}</p>
-                    {shp.failureReason && <p className="text-xs text-danger">Failure: {shp.failureReason}</p>}
                   </div>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {action && (
-                    <button
-                      type="button"
-                      onClick={() => updateShipmentStatus(shp.id, action.status, action.status === 'Delivered' ? { proofNotes: 'Delivered to storefront' } : {})}
-                      className="btn btn-primary delivery-action w-full"
-                    >
-                      <CheckCircle2 className="w-4 h-4" /> {action.label}
-                    </button>
+                  {shp.status !== 'Failed' && (
+                    <ol className="delivery-pipeline" aria-label="Delivery progress">
+                      {pipeline.map((step, i) => (
+                        <li key={step} className={i <= stepIdx ? 'is-done' : ''}>
+                          <span className="dp-dot" />
+                          <span className="dp-label">{step === 'InTransit' ? 'In transit' : step}</span>
+                        </li>
+                      ))}
+                    </ol>
                   )}
-                  {shp.status === 'InTransit' && (
-                    <button
-                      type="button"
-                      onClick={() => updateShipmentStatus(shp.id, 'Failed', { failureReason: 'Customer unavailable' })}
-                      className="btn btn-danger delivery-action w-full"
-                    >
-                      <XCircle className="w-4 h-4" /> Mark failed
-                    </button>
-                  )}
-                </div>
-              </article>
-            );
-          })}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {action && (
+                      <Pressable
+                        onClick={() => updateShipmentStatus(shp.id, action.status, action.status === 'Delivered' ? { proofNotes: 'Delivered to storefront' } : {})}
+                        className="btn btn-primary delivery-action w-full"
+                      >
+                        <CheckCircle2 className="w-4 h-4" /> {action.label}
+                      </Pressable>
+                    )}
+                    {shp.status === 'InTransit' && (
+                      <Pressable
+                        onClick={() => updateShipmentStatus(shp.id, 'Failed', { failureReason: 'Customer unavailable' })}
+                        className="btn btn-danger delivery-action w-full"
+                      >
+                        <XCircle className="w-4 h-4" /> Mark failed
+                      </Pressable>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </Stagger>
         </div>
-      </div>
+      </AmbientShell>
     );
   }
 
   // ================= 5. CLIENT PORTAL =================
   if (navState === 'client_portal') {
+    const freq = frequentProductsFromOrders(orders as any, 5);
+    const last = lastOrderLines(orders as any);
+    const aiVisual = deriveAiVisualState({
+      isAiLoading,
+      voiceState,
+      chatError,
+      voiceError,
+    });
+    const chatReactive = aiVisual === 'thinking' || aiVisual === 'listening';
+
     return (
-      <div className="app-shell">
+      <AmbientShell intensity={clientTab === 'chat' ? 'chat' : 'commerce'} reactive={chatReactive} className="app-shell !bg-transparent">
         <PortalHeader
           icon={Store}
           title={currentClient?.storeName || 'Babar General Store'}
           subtitle={`Shopkeeper · ${currentClient?.name || 'Account'}`}
           onLogout={handleLogout}
         >
-          <button type="button" onClick={() => setCheckoutModal(true)} className="btn btn-ghost btn-sm relative">
+          <Pressable onClick={() => setCheckoutModal(true)} className="btn btn-ghost btn-sm relative">
             <ShoppingCart className="w-4 h-4 text-accent" />
-            <span className="hidden xs:inline sm:inline">Cart</span>
+            <span className="hidden sm:inline">Cart</span>
             <span className="font-bold">{totalCartItemsCount}</span>
             {totalCartItemsCount > 0 && (
               <span className="absolute -top-1 -right-1 bg-accent text-brand font-bold text-[10px] min-w-4 h-4 px-1 rounded-full grid place-items-center">
                 {totalCartItemsCount}
               </span>
             )}
-          </button>
+          </Pressable>
         </PortalHeader>
 
         <div className="portal-main">
+          <FadeIn>
+            <div className="insight-strip">
+              <div className="surface-card p-4 sm:p-5 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="font-serif font-bold text-brand text-sm">One-click reorder</h3>
+                  {last && <span className="text-[10px] text-muted">{last.orderId}</span>}
+                </div>
+                {last ? (
+                  <>
+                    <p className="text-xs text-muted leading-relaxed">
+                      Restock {last.lines.length} line(s) from your latest order · PKR {last.totalAmount.toLocaleString()}
+                    </p>
+                    <Pressable disabled={cartBusy} onClick={reorderLastOrder} className="btn btn-accent btn-sm">
+                      <RefreshCw className="w-3.5 h-3.5" /> Reorder into cart
+                    </Pressable>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted">Place an order once to unlock reorder.</p>
+                )}
+              </div>
+              <div className="surface-card p-4 sm:p-5 space-y-3">
+                <h3 className="font-serif font-bold text-brand text-sm">Frequently ordered</h3>
+                {freq.length === 0 && <p className="text-xs text-muted">Built from your real order history.</p>}
+                <div className="space-y-2">
+                  {freq.slice(0, 3).map((f) => (
+                    <div key={f.productId} className="product-chip">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-brand truncate">{f.name}</p>
+                        <p className="text-[10px] text-muted">{f.timesOrdered}× ordered · {f.totalQty} {f.unit}</p>
+                      </div>
+                      <Pressable
+                        disabled={cartBusy}
+                        className="btn btn-primary btn-sm"
+                        onClick={() => addToCart(f.productId, Math.max(1, products.find((p) => p.id === f.productId)?.moq || 1))}
+                      >
+                        Add
+                      </Pressable>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </FadeIn>
+
           <TabRail
             value={clientTab}
             onChange={(id) => setClientTab(id as typeof clientTab)}
@@ -1613,21 +2011,29 @@ export default function App() {
 
           {clientTab === 'chat' && (
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-5">
-              <div className="lg:col-span-2 surface-card chat-shell">
-                <div className="px-3 sm:px-4 py-3 bg-brand text-canvas flex flex-wrap items-center justify-between gap-2">
+              <div className={`lg:col-span-2 surface-card chat-shell !border-0 shadow-lift ${aiVisual === 'thinking' ? 'is-thinking' : ''} ${aiVisual === 'listening' ? 'is-listening' : ''}`}>
+                <div className="chat-top px-3 sm:px-4 py-3 flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-9 h-9 rounded-full bg-accent text-brand grid place-items-center font-bold text-xs shrink-0">AI</div>
+                    <div className="ai-avatar-slot">
+                      <AiAura state={aiVisual} />
+                      <div className="ai-avatar-core">AI</div>
+                    </div>
                     <div className="min-w-0">
-                      <h3 className="font-serif font-bold text-sm truncate">Peshawar Wholesale Assistant</h3>
-                      <p className="text-[10px] text-accent">WhatsApp-style voice · EN / اردو / پښتو</p>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="font-serif font-bold text-sm truncate text-white">Wholesale Copilot</h3>
+                        <AiStateLabel state={aiVisual} />
+                      </div>
+                      <p className="text-[10px] text-accent/90">
+                        {aiStatus?.geminiConfigured ? 'Gemini ready · voice auto-send' : 'Local agents · voice + text'}
+                      </p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <label className="hidden sm:flex items-center gap-1.5 text-[10px] text-accent cursor-pointer" title="Review/edit transcript before sending">
+                    <label className="hidden sm:flex items-center gap-1.5 text-[10px] text-slate-300 cursor-pointer">
                       <input type="checkbox" checked={voiceReviewMode} onChange={(e) => setVoiceReviewMode(e.target.checked)} className="rounded border-accent" />
                       Review
                     </label>
-                    <div className="flex bg-black/20 p-0.5 rounded-lg" role="group" aria-label="Chat language">
+                    <div className="flex bg-black/30 p-0.5 rounded-lg" role="group" aria-label="Chat language">
                       {([
                         ['ur', 'اردو'],
                         ['ps', 'پښتو'],
@@ -1637,7 +2043,7 @@ export default function App() {
                           key={code}
                           type="button"
                           onClick={() => setChatLanguage(code)}
-                          className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition ${chatLanguage === code ? 'bg-accent text-brand' : 'text-canvas/80 hover:text-white'}`}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition ${chatLanguage === code ? 'bg-accent text-brand' : 'text-slate-300 hover:text-white'}`}
                         >
                           {label}
                         </button>
@@ -1646,86 +2052,89 @@ export default function App() {
                   </div>
                 </div>
 
-                <div ref={chatScrollRef} className="flex-1 p-3 sm:p-4 overflow-y-auto space-y-3 bg-canvas/50">
+                <div ref={chatScrollRef} className="chat-thread space-y-3">
+                  <SoftProgress show={isAiLoading || Boolean(voiceBusyNote)} label={voiceBusyNote || (isAiLoading ? 'Assistant is working…' : undefined)} />
                   {chatHistory.map((msg, idx) => (
-                    <div key={idx} className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
-                      <div className={`max-w-[92%] sm:max-w-[85%] p-3.5 text-sm leading-relaxed ${msg.sender === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'}`}>
-                        <p className="whitespace-pre-wrap">{msg.text}</p>
-                        {msg.products && msg.products.length > 0 && (
-                          <div className="mt-3 pt-3 border-t border-black/5 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                            {msg.products.map((p) => {
-                              const avail = p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved);
-                              return (
-                                <div key={p.id} className="bg-canvas/80 p-2.5 rounded-xl border border-line flex flex-col gap-2">
-                                  <div>
-                                    <h4 className="font-serif font-bold text-xs text-brand">{p.name}</h4>
-                                    <p className="text-[10px] text-muted mt-0.5">MOQ {p.moq} · {p.unit}</p>
-                                    <p className="text-xs font-semibold text-brand mt-1">PKR {p.sellingPrice.toLocaleString()}</p>
-                                    <div className="mt-2">
-                                      <StockMeter available={avail} capacity={Math.max(p.stockOnHand, avail, 1)} />
+                    <ChatMessageMotion key={idx} fromUser={msg.sender === 'user'}>
+                      <div className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
+                        <div className={`max-w-[92%] sm:max-w-[85%] p-3.5 text-sm leading-relaxed ${msg.sender === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'}`}>
+                          {msg.sender === 'ai' && (
+                            <div className="mb-2">
+                              <AiModeChip geminiUsed={msg.geminiUsed} fallbackReason={msg.fallbackReason || msg.ttsNote} />
+                            </div>
+                          )}
+                          <p className="whitespace-pre-wrap">{msg.text}</p>
+                          {msg.products && msg.products.length > 0 && (
+                            <div className="mt-3 pt-3 border-t border-white/10 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              {msg.products.map((p) => {
+                                const avail = p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved);
+                                return (
+                                  <div key={p.id} className="bg-black/25 p-2.5 rounded-xl border border-white/10 flex flex-col gap-2">
+                                    <div>
+                                      <h4 className="font-serif font-bold text-xs text-white">{p.name}</h4>
+                                      <p className="text-[10px] text-slate-400 mt-0.5">MOQ {p.moq} · {p.unit}</p>
+                                      <p className="text-xs font-semibold text-accent mt-1">PKR {p.sellingPrice.toLocaleString()}</p>
+                                      <div className="mt-2">
+                                        <StockMeter available={avail} capacity={Math.max(p.stockOnHand, avail, 1)} />
+                                      </div>
                                     </div>
+                                    <Pressable disabled={cartBusy} onClick={() => addToCart(p.id, Math.max(p.moq, 1))} className="btn btn-accent btn-sm w-full">Add to cart</Pressable>
                                   </div>
-                                  <button type="button" disabled={cartBusy} onClick={() => addToCart(p.id, Math.max(p.moq, 1))} className="btn btn-primary btn-sm w-full">Add to cart</button>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-                        {msg.cartPreview && (
-                          <div className="mt-3 pt-3 border-t border-line space-y-1">
-                            <p className="text-[10px] font-bold uppercase tracking-wide text-accent">Cart preview</p>
-                            {msg.cartPreview.lines.map((line, i) => (
-                              <p key={i} className="text-xs text-muted">{line.quantity} × {line.name} — PKR {line.lineTotal.toLocaleString()}</p>
-                            ))}
-                            <p className="text-xs font-semibold text-brand">Subtotal PKR {msg.cartPreview.subtotal.toLocaleString()}</p>
-                          </div>
-                        )}
-                        {msg.needsConfirmation && (
-                          <div className="mt-3 flex flex-wrap items-center gap-2">
-                            <button type="button" onClick={() => setCheckoutModal(true)} className="btn btn-accent btn-sm">Review & confirm checkout</button>
-                            <span className="text-[10px] text-warning">Not placed until you confirm.</span>
-                          </div>
-                        )}
-                        {msg.sender === 'ai' && (
-                          <div className="mt-3 flex flex-wrap items-center gap-2">
-                            <button type="button" onClick={() => playAssistantTts(msg, idx)} className="btn btn-secondary btn-sm">
-                              {playingMsgIdx === idx ? <Pause className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-                              {playingMsgIdx === idx ? 'Pause' : 'Play'}
-                            </button>
-                            {msg.ttsNote && <span className="text-[10px] text-warning leading-snug">{msg.ttsNote}</span>}
-                          </div>
-                        )}
-                        {msg.error && msg.retryText && (
-                          <button type="button" onClick={() => handleSendMessage(msg.retryText)} className="mt-3 text-xs underline text-brand font-semibold">Retry message</button>
-                        )}
+                                );
+                              })}
+                            </div>
+                          )}
+                          {msg.cartPreview && (
+                            <div className="mt-3 pt-3 border-t border-white/10 space-y-1">
+                              <p className="text-[10px] font-bold uppercase tracking-wide text-accent">Cart preview</p>
+                              {msg.cartPreview.lines.map((line, i) => (
+                                <p key={i} className="text-xs text-slate-300">{line.quantity} × {line.name} — PKR {line.lineTotal.toLocaleString()}</p>
+                              ))}
+                              <p className="text-xs font-semibold text-white">Subtotal PKR {msg.cartPreview.subtotal.toLocaleString()}</p>
+                            </div>
+                          )}
+                          {msg.needsConfirmation && (
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <Pressable onClick={() => setCheckoutModal(true)} className="btn btn-accent btn-sm">Review & confirm checkout</Pressable>
+                              <span className="text-[10px] text-amber-300">Not placed until you confirm.</span>
+                            </div>
+                          )}
+                          {msg.sender === 'ai' && (
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <button type="button" onClick={() => playAssistantTts(msg, idx)} className="btn btn-secondary btn-sm !bg-white/10 !text-white !border-white/15">
+                                {playingMsgIdx === idx ? <Pause className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                                {playingMsgIdx === idx ? 'Pause' : 'Play'}
+                              </button>
+                              {msg.ttsNote && <span className="text-[10px] text-amber-200/90 leading-snug">{msg.ttsNote}</span>}
+                            </div>
+                          )}
+                          {msg.error && msg.retryText && (
+                            <button type="button" onClick={() => handleSendMessage(msg.retryText)} className="mt-3 text-xs underline text-accent font-semibold">Retry message</button>
+                          )}
+                        </div>
+                        <span className="text-[10px] text-slate-500 mt-1 px-1">{msg.timestamp}</span>
                       </div>
-                      <span className="text-[10px] text-muted/80 mt-1 px-1">{msg.timestamp}</span>
-                    </div>
+                    </ChatMessageMotion>
                   ))}
                   {isAiLoading && (
                     <div className="flex items-start">
-                      <div className="chat-bubble-ai px-4 py-3 flex items-center gap-2">
-                        <span className="typing-dot" />
-                        <span className="typing-dot" />
-                        <span className="typing-dot" />
-                        <span className="text-xs text-muted ml-1">{voiceBusyNote || 'Checking live stock & cart…'}</span>
-                      </div>
+                      <TypingDots label={voiceBusyNote || 'Checking live stock & cart…'} />
                     </div>
                   )}
                 </div>
 
-                <div className="p-3 bg-surface border-t border-line space-y-2">
+                <div className="chat-composer space-y-2">
                   {chatError && <AlertBanner>{chatError}</AlertBanner>}
                   {voiceError && <AlertBanner>{voiceError}</AlertBanner>}
 
                   {voiceState === 'recording' && (
-                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-red-50 border border-red-200 px-3 py-2.5">
-                      <div className="flex items-center gap-2 text-red-700 text-xs font-semibold">
-                        <span className="rec-pulse" />
-                        Recording… {formatDuration(recordingMs)} / 1:00
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-rose-500/15 border border-rose-400/30 px-3 py-2.5">
+                      <div className="flex items-center gap-3 text-rose-100 text-xs font-semibold">
+                        <WaveformBars active />
+                        <span>Recording… {formatDuration(recordingMs)} / 1:00</span>
                       </div>
                       <div className="flex gap-2">
-                        <button type="button" onClick={stopVoiceRecording} className="btn btn-primary btn-sm"><Square className="w-3 h-3" /> Stop</button>
+                        <button type="button" onClick={stopVoiceRecording} className="btn btn-accent btn-sm"><Square className="w-3 h-3" /> Stop</button>
                         <button type="button" onClick={cancelVoiceRecording} className="btn btn-danger btn-sm"><X className="w-3 h-3" /> Cancel</button>
                       </div>
                     </div>
@@ -1779,16 +2188,12 @@ export default function App() {
                   )}
 
                   <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      title={voiceSupported ? 'Record voice message' : 'Voice unsupported in this browser'}
-                      aria-label={voiceState === 'recording' ? 'Stop recording' : 'Start recording'}
-                      onClick={() => (voiceState === 'recording' ? stopVoiceRecording() : startVoiceRecording())}
+                    <MicOrb
+                      recording={voiceState === 'recording'}
                       disabled={isAiLoading || voiceState === 'transcribing' || voiceState === 'submitting' || voiceState === 'review'}
-                      className={`btn btn-icon shrink-0 ${voiceState === 'recording' ? 'bg-red-600 text-white border-red-600' : 'btn-secondary'}`}
-                    >
-                      <Mic className="w-4 h-4" />
-                    </button>
+                      title={voiceSupported ? 'Record voice message' : 'Voice unsupported in this browser'}
+                      onClick={() => (voiceState === 'recording' ? stopVoiceRecording() : startVoiceRecording())}
+                    />
                     <input
                       type="text"
                       value={chatInput}
@@ -1798,14 +2203,39 @@ export default function App() {
                       className="field flex-1 !py-2.5"
                       disabled={isAiLoading || voiceState === 'submitting'}
                     />
-                    <button type="button" onClick={() => handleSendMessage()} disabled={isAiLoading || !chatInput.trim() || voiceState === 'submitting'} className="btn btn-primary btn-icon shrink-0" aria-label="Send message">
+                    <Pressable onClick={() => handleSendMessage()} disabled={isAiLoading || !chatInput.trim() || voiceState === 'submitting'} className="btn btn-accent btn-icon shrink-0" aria-label="Send message">
                       <Send className="w-4 h-4" />
-                    </button>
+                    </Pressable>
                   </div>
                 </div>
               </div>
 
               <aside className="space-y-4">
+                <div className="surface-card p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <h4 className="font-serif font-bold text-brand text-sm">Cart preview</h4>
+                    <span className="text-[10px] text-muted">{totalCartItemsCount} items</span>
+                  </div>
+                  {totalCartItemsCount === 0 ? (
+                    <p className="text-xs text-muted">Add from chat or catalog — checkout stays explicit.</p>
+                  ) : (
+                    <ul className="space-y-2 max-h-36 overflow-y-auto">
+                      {Object.keys(cart).slice(0, 6).map((id) => {
+                        const p = products.find((prod) => prod.id === id);
+                        if (!p) return null;
+                        return (
+                          <li key={id} className="flex justify-between gap-2 text-xs">
+                            <span className="truncate text-brand font-medium">{p.name} × {cart[id]}</span>
+                            <span className="text-muted shrink-0">PKR {(p.sellingPrice * cart[id]).toLocaleString()}</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                  <Pressable disabled={totalCartItemsCount === 0} onClick={() => setCheckoutModal(true)} className="btn btn-accent btn-sm w-full">
+                    Review cart
+                  </Pressable>
+                </div>
                 <div className="surface-card p-5 space-y-3">
                   <h4 className="font-serif font-bold text-brand text-sm flex items-center gap-2"><Mic className="w-4 h-4 text-accent" /> Voice tips</h4>
                   <ul className="text-[11px] text-muted space-y-1.5 leading-relaxed list-disc pl-4">
@@ -1828,15 +2258,14 @@ export default function App() {
                       'ما ته د پیپسي پنځه کارټنه پکار دي.',
                       'Show my cart and propose checkout',
                     ].map((prompt) => (
-                      <button
+                      <Pressable
                         key={prompt}
-                        type="button"
                         disabled={isAiLoading}
                         onClick={() => handleSendMessage(prompt)}
-                        className="w-full text-left p-3 rounded-xl bg-canvas/70 hover:bg-canvas border border-line text-xs text-brand font-medium transition disabled:opacity-60"
+                        className="w-full text-left p-3 rounded-xl bg-canvas/70 hover:bg-canvas border border-line text-xs text-brand font-medium disabled:opacity-60"
                       >
                         “{prompt}”
-                      </button>
+                      </Pressable>
                     ))}
                   </div>
                 </div>
@@ -1852,11 +2281,11 @@ export default function App() {
                   <EmptyState icon={Package} title="No products available" description="Ask the assistant or check back when wholesalers restock." />
                 </div>
               )}
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+              <Stagger className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
                 {products.filter((p) => p.status !== 'inactive').map((p) => {
                   const avail = p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved);
                   return (
-                    <article key={p.id} className="surface-card p-5 flex flex-col justify-between gap-4">
+                    <article key={p.id} className="surface-card product-card p-5 flex flex-col justify-between gap-4">
                       <div className="space-y-2">
                         <div className="flex items-center justify-between gap-2">
                           <span className="status-pill status-neutral">{p.sku}</span>
@@ -1868,12 +2297,12 @@ export default function App() {
                       </div>
                       <div className="flex items-center justify-between gap-3 pt-3 border-t border-line">
                         <span className="text-base font-bold text-brand">PKR {p.sellingPrice.toLocaleString()}</span>
-                        <button type="button" disabled={cartBusy || avail <= 0} onClick={() => addToCart(p.id, p.moq)} className="btn btn-primary btn-sm">Add to cart</button>
+                        <Pressable disabled={cartBusy || avail <= 0} onClick={() => addToCart(p.id, p.moq)} className="btn btn-accent btn-sm">Add to cart</Pressable>
                       </div>
                     </article>
                   );
                 })}
-              </div>
+              </Stagger>
             </div>
           )}
 
@@ -2002,7 +2431,7 @@ export default function App() {
             </>
           )}
         </ModalFrame>
-      </div>
+      </AmbientShell>
     );
   }
 
@@ -2023,9 +2452,18 @@ export default function App() {
       }, 0);
     }, 0);
     const myProfit = myRevenue - myCogs;
+    const health = inventoryHealth(myProducts as any);
+    const sellers = bestSellersFromSubOrders(orders as any, (sub) => (sub as any).wholesalerId === wh?.id, 5);
+    const pendingSubs = mySubOrders.filter((s) => s.status === 'Submitted').length;
+    const tenantOrders = (orders || []).filter((o) => (o.subOrders || []).some((s) => s.wholesalerId === wh?.id));
+    const salesSpark = orderAmountSeries(tenantOrders as any, 8);
+    const lowStockSkus = myProducts.filter((p) => {
+      const avail = p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved);
+      return p.status !== 'inactive' && (avail <= p.reorderPoint || p.status === 'low_stock' || avail <= 0);
+    }).filter((p, i, arr) => arr.findIndex((x) => x.name === p.name) === i);
 
     return (
-      <div className="app-shell">
+      <AmbientShell intensity="ops" className="app-shell !bg-transparent">
         <PortalHeader
           icon={Package}
           title={wh?.name || 'Wholesaler'}
@@ -2044,11 +2482,49 @@ export default function App() {
           />
 
           {wholesalerTab === 'dashboard' && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-              <KpiCard label="Revenue" value={`PKR ${myRevenue.toLocaleString()}`} />
-              <KpiCard label="COGS" value={`PKR ${myCogs.toLocaleString()}`} tone="muted" />
-              <KpiCard label="Gross profit" value={`PKR ${myProfit.toLocaleString()}`} tone="accent" />
-              <KpiCard label="Tenant status" value={<StatusBadge status={wh?.status || 'unknown'} />} tone="success" />
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <KpiCard label="Revenue" value={`PKR ${myRevenue.toLocaleString()}`} />
+                <KpiCard label="COGS" value={`PKR ${myCogs.toLocaleString()}`} tone="muted" />
+                <KpiCard label="Gross profit" value={`PKR ${myProfit.toLocaleString()}`} tone="accent" />
+                <KpiCard label="Pending review" value={pendingSubs} tone={pendingSubs ? 'accent' : 'success'} />
+              </div>
+              <div className="insight-strip">
+                <div className="surface-card p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="font-serif font-bold text-brand text-sm">Inventory health</h3>
+                    <StatusBadge status={wh?.status || 'unknown'} />
+                  </div>
+                  <HealthMeter healthy={health.healthy} low={health.low} out={health.out} />
+                  {lowStockSkus.length > 0 ? (
+                    <ul className="text-xs text-muted space-y-1.5">
+                      {lowStockSkus.slice(0, 4).map((p) => (
+                        <li key={p.id} className="flex justify-between gap-2">
+                          <span className="truncate text-brand font-medium">{p.name}</span>
+                          <span>{p.availableStock ?? Math.max(0, p.stockOnHand - p.stockReserved)} left</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-xs text-muted">All active SKUs above reorder point.</p>
+                  )}
+                </div>
+                <div className="surface-card p-5 space-y-3">
+                  <h3 className="font-serif font-bold text-brand text-sm">Sales pulse</h3>
+                  <SparkBars values={salesSpark} />
+                  <p className="text-[11px] text-muted">Order totals for this tenant · live data only</p>
+                  <h4 className="text-xs font-semibold text-brand pt-1">Best sellers</h4>
+                  {sellers.length === 0 && <p className="text-xs text-muted">Approve suborders to unlock rankings.</p>}
+                  <ul className="space-y-2">
+                    {sellers.map((s) => (
+                      <li key={s.name} className="flex justify-between gap-2 text-xs">
+                        <span className="font-medium text-brand truncate">{s.name}</span>
+                        <span className="text-muted shrink-0">{s.qty} u · PKR {s.revenue.toLocaleString()}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
             </div>
           )}
 
@@ -2131,15 +2607,41 @@ export default function App() {
             </div>
           )}
         </div>
-      </div>
+      </AmbientShell>
     );
   }
 
   // ================= 7. ADMIN PORTAL =================
   if (navState === 'admin_portal') {
     const platformGmv = orders.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+    const unassigned = shipments.filter((s) => s.status === 'Unassigned');
+    const failedShipments = shipments.filter((s) => s.status === 'Failed');
+    const pendingApplications = wholesalerApplications.filter((a) => a.status === 'pending');
+    const platformSpark = orderAmountSeries(orders as any, 8);
+    const platformSellers = bestSellersFromSubOrders(orders as any, undefined, 5);
+    const stockHealth = inventoryHealth(products as any);
+    const outstanding = invoices.reduce((sum, inv) => sum + Number(inv.outstandingAmount ?? (inv.amount - inv.paidAmount)), 0);
+    const recentActivity = [
+      ...auditEvents.slice(0, 8).map((e) => ({
+        id: e.id,
+        kind: 'audit' as const,
+        title: e.action,
+        detail: e.details,
+        at: e.timestamp,
+      })),
+      ...failedShipments.slice(0, 4).map((s) => ({
+        id: `fail-${s.id}`,
+        kind: 'exception' as const,
+        title: `Failed shipment ${s.id}`,
+        detail: s.failureReason || 'Exception recorded',
+        at: s.expectedDate,
+      })),
+    ]
+      .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+      .slice(0, 10);
+
     return (
-      <div className="app-shell">
+      <AmbientShell intensity="ops" className="app-shell !bg-transparent">
         <PortalHeader
           icon={ShieldCheck}
           title="Admin control hub"
@@ -2153,18 +2655,74 @@ export default function App() {
             tabs={[
               { id: 'overview', label: 'Overview', icon: DollarSign },
               { id: 'wholesalers', label: 'Wholesalers', icon: Users },
+              { id: 'applications', label: 'Applications', icon: ClipboardList, count: pendingApplications.length },
               { id: 'all_orders', label: 'Orders', icon: FileText },
-              { id: 'dispatch', label: 'Dispatch', icon: Truck },
+              { id: 'dispatch', label: 'Dispatch', icon: Truck, count: unassigned.length + failedShipments.length },
               { id: 'audit', label: 'Audit', icon: ShieldCheck },
             ]}
           />
 
           {adminTab === 'overview' && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-              <KpiCard label="Platform GMV" value={`PKR ${platformGmv.toLocaleString()}`} />
-              <KpiCard label="Wholesalers" value={wholesalers.length} tone="success" />
-              <KpiCard label="Client orders" value={orders.length} />
-              <KpiCard label="Unassigned shipments" value={shipments.filter((s) => s.status === 'Unassigned').length} tone="accent" />
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <KpiCard label="Platform GMV" value={`PKR ${platformGmv.toLocaleString()}`} />
+                <KpiCard label="Wholesalers" value={wholesalers.length} tone="success" />
+                <KpiCard label="Outstanding AR" value={`PKR ${outstanding.toLocaleString()}`} tone="accent" />
+                <KpiCard label="Exceptions" value={failedShipments.length + unassigned.length} tone={failedShipments.length ? 'muted' : 'success'} />
+              </div>
+              <div className="insight-strip">
+                <div className="surface-card p-5 space-y-3">
+                  <h3 className="font-serif font-bold text-brand text-sm">GMV pulse</h3>
+                  <SparkBars values={platformSpark} />
+                  <p className="text-[11px] text-muted">{orders.length} client order(s) · live totals</p>
+                  <HealthMeter healthy={stockHealth.healthy} low={stockHealth.low} out={stockHealth.out} />
+                </div>
+                <div className="surface-card p-5 space-y-3">
+                  <h3 className="font-serif font-bold text-brand text-sm">Ops exceptions</h3>
+                  {unassigned.length === 0 && failedShipments.length === 0 ? (
+                    <p className="text-xs text-muted">No unassigned or failed shipments.</p>
+                  ) : (
+                    <ul className="space-y-2 text-xs">
+                      {unassigned.slice(0, 3).map((s) => (
+                        <li key={s.id} className="flex justify-between gap-2 rounded-lg bg-canvas/70 px-3 py-2 border border-line">
+                          <span className="font-medium text-brand truncate">{s.id} · unassigned</span>
+                          <Pressable onClick={() => setAdminTab('dispatch')} className="text-accent font-semibold shrink-0">Dispatch</Pressable>
+                        </li>
+                      ))}
+                      {failedShipments.slice(0, 3).map((s) => (
+                        <li key={s.id} className="rounded-lg bg-rose-50 px-3 py-2 border border-rose-200 text-danger">
+                          {s.id}: {s.failureReason || 'Failed'}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <h4 className="text-xs font-semibold text-brand pt-1">Top movers</h4>
+                  {platformSellers.length === 0 && <p className="text-xs text-muted">No approved sales yet.</p>}
+                  <ul className="space-y-1.5">
+                    {platformSellers.map((s) => (
+                      <li key={s.name} className="flex justify-between gap-2 text-xs">
+                        <span className="truncate text-brand font-medium">{s.name}</span>
+                        <span className="text-muted shrink-0">{s.qty} u</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+              <div className="surface-card p-5 space-y-3">
+                <h3 className="font-serif font-bold text-brand text-sm">Operational timeline</h3>
+                {recentActivity.length === 0 && <EmptyState icon={ShieldCheck} title="Quiet so far" description="Audit events and delivery exceptions will stream here." />}
+                <div className="space-y-2">
+                  {recentActivity.map((evt) => (
+                    <div key={evt.id} className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-1 rounded-xl border border-line bg-canvas/50 px-3 py-2.5">
+                      <div className="min-w-0">
+                        <span className={`text-[10px] px-2 py-0.5 rounded font-mono ${evt.kind === 'exception' ? 'bg-danger text-white' : 'bg-brand text-canvas'}`}>{evt.title}</span>
+                        <p className="text-xs text-brand mt-1 truncate">{evt.detail}</p>
+                      </div>
+                      <span className="text-[10px] text-muted shrink-0">{new Date(evt.at).toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 
@@ -2198,6 +2756,72 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          )}
+
+          {adminTab === 'applications' && (
+            <div className="surface-card p-5 sm:p-6 space-y-4">
+              <div className="flex flex-wrap justify-between items-center gap-3">
+                <div>
+                  <h3 className="font-serif font-bold text-brand text-lg">Wholesaler applications</h3>
+                  <p className="text-xs text-muted mt-1">Review public requests. Approval creates a tenant and emails a password setup link—never a plaintext password.</p>
+                </div>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => fetchWholesalerApplications()}>
+                  <RefreshCw className="w-3.5 h-3.5" /> Refresh
+                </button>
+              </div>
+              <AlertBanner>{actionError}</AlertBanner>
+              {wholesalerApplications.length === 0 && (
+                <EmptyState icon={ClipboardList} title="No applications yet" description="When a business submits Become a Wholesaler, it appears here for review." />
+              )}
+              <div className="space-y-3">
+                {wholesalerApplications.map((app) => (
+                  <article key={app.id} className="rounded-2xl border border-line bg-canvas/50 p-4 sm:p-5 space-y-3">
+                    <div className="flex flex-wrap justify-between gap-2 items-start">
+                      <div className="min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h4 className="font-serif font-bold text-brand text-base">{app.businessName}</h4>
+                          <StatusBadge status={app.status} />
+                        </div>
+                        <p className="text-xs text-muted">
+                          {app.applicantName} · {app.email} · {app.phone}
+                        </p>
+                        <p className="text-xs text-muted">{app.location} · {app.category}</p>
+                      </div>
+                      <span className="text-[10px] text-muted shrink-0">{new Date(app.createdAt).toLocaleString()}</span>
+                    </div>
+                    <p className="text-sm text-brand leading-relaxed whitespace-pre-wrap">{app.description}</p>
+                    {app.rejectReason && <p className="text-xs text-danger">Rejection reason: {app.rejectReason}</p>}
+                    {app.wholesalerId && <p className="text-xs text-success font-semibold">Tenant created: {app.wholesalerId}</p>}
+                    {app.status === 'pending' && (
+                      <div className="flex flex-col sm:flex-row gap-2 pt-1 border-t border-line">
+                        <input
+                          className="field !py-2 flex-1 text-xs"
+                          placeholder="Optional rejection reason"
+                          value={rejectReasonDraft[app.id] || ''}
+                          onChange={(e) => setRejectReasonDraft({ ...rejectReasonDraft, [app.id]: e.target.value })}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={applicationBusyId === app.id}
+                          onClick={() => approveApplication(app.id)}
+                        >
+                          {applicationBusyId === app.id ? 'Working…' : 'Approve'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          disabled={applicationBusyId === app.id}
+                          onClick={() => rejectApplication(app.id)}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    )}
+                  </article>
+                ))}
               </div>
             </div>
           )}
@@ -2339,7 +2963,7 @@ export default function App() {
             </div>
           </form>
         </ModalFrame>
-      </div>
+      </AmbientShell>
     );
   }
 

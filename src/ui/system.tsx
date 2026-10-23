@@ -1,5 +1,8 @@
 import React from 'react';
 import { LogOut, type LucideIcon } from 'lucide-react';
+import { LivingBackdrop } from '../motion/LivingBackdrop';
+import { motion } from '../motion/Motion';
+import { usePrefersReducedMotion } from '../motion/usePrefersReducedMotion';
 
 export function statusTone(status: string): 'success' | 'warning' | 'danger' | 'info' | 'neutral' {
   const s = String(status || '').toLowerCase();
@@ -145,6 +148,11 @@ export function AlertBanner({
   return <div className={`alert alert-${tone}`}>{children}</div>;
 }
 
+export function InfoBanner({ children }: { children: React.ReactNode }) {
+  if (!children) return null;
+  return <div className="alert alert-info">{children}</div>;
+}
+
 export function ModalFrame({
   open,
   onClose,
@@ -158,23 +166,32 @@ export function ModalFrame({
   children: React.ReactNode;
   zClass?: string;
 }) {
+  const reduced = usePrefersReducedMotion();
   if (!open) return null;
   return (
     <div className={`modal-backdrop ${zClass}`} role="dialog" aria-modal="true" aria-label={title}>
-      <div className="modal-panel space-y-4">
-        <div className="flex items-start justify-between gap-3">
-          <h3 className="font-serif font-bold text-brand text-lg leading-tight">{title}</h3>
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn btn-secondary btn-sm !px-2.5"
-            aria-label="Close dialog"
-          >
-            ✕
-          </button>
+      {reduced ? (
+        <div className="modal-panel space-y-4">
+          <div className="flex items-start justify-between gap-3">
+            <h3 className="font-serif font-bold text-brand text-lg leading-tight">{title}</h3>
+            <button type="button" onClick={onClose} className="btn btn-secondary btn-sm !px-2.5" aria-label="Close dialog">✕</button>
+          </div>
+          {children}
         </div>
-        {children}
-      </div>
+      ) : (
+        <motion.div
+          className="modal-panel space-y-4"
+          initial={{ opacity: 0, y: 24, scale: 0.96 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          transition={{ type: 'spring', stiffness: 380, damping: 28 }}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <h3 className="font-serif font-bold text-brand text-lg leading-tight">{title}</h3>
+            <button type="button" onClick={onClose} className="btn btn-secondary btn-sm !px-2.5" aria-label="Close dialog">✕</button>
+          </div>
+          {children}
+        </motion.div>
+      )}
     </div>
   );
 }
@@ -197,17 +214,18 @@ export function AuthLayout({
   footer?: React.ReactNode;
 }) {
   return (
-    <div className="auth-shell">
-      <div className="auth-card space-y-5">
+    <div className="auth-shell relative overflow-hidden">
+      <LivingBackdrop intensity="landing" className="!absolute over-photo" />
+      <div className="auth-card space-y-5 relative z-10">
         <button type="button" onClick={onBack} className="text-xs font-semibold text-brand hover:text-accent transition inline-flex items-center gap-1.5">
           ← Back to gateway
         </button>
-        <div className="text-center space-y-2">
-          <div className="w-12 h-12 rounded-2xl bg-brand text-accent mx-auto grid place-items-center shadow-card">
+        <div className="text-center space-y-2.5">
+          <div className="w-14 h-14 rounded-2xl bg-brand text-accent mx-auto grid place-items-center shadow-lift ring-2 ring-accent/30">
             <Icon className="w-6 h-6" />
           </div>
-          <h2 className="text-2xl font-serif font-bold text-brand">{title}</h2>
-          <p className="text-xs text-muted leading-relaxed">{subtitle}</p>
+          <h2 className="text-2xl sm:text-[1.65rem] font-serif font-bold text-brand tracking-tight">{title}</h2>
+          <p className="text-xs text-muted leading-relaxed max-w-sm mx-auto">{subtitle}</p>
         </div>
         {error && <AlertBanner>{error}</AlertBanner>}
         {children}

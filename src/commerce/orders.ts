@@ -272,6 +272,18 @@ export async function placeOrder(
     const view = await loadOrderView(orderId, { db: tx as any });
     if (!view) throw new HttpError(500, 'Order created but could not be loaded.');
     return view;
+  }).then(async (view) => {
+    try {
+      const { notifyOrderPlaced } = await import('../email/notify');
+      await notifyOrderPlaced({
+        orderId: view.id,
+        clientId: user.id,
+        subOrders: view.subOrders.map((s) => ({ id: s.id, wholesalerId: s.wholesalerId })),
+      });
+    } catch (err: any) {
+      console.warn('[notify] order placed:', err?.message || err);
+    }
+    return view;
   });
 }
 
@@ -375,7 +387,21 @@ export async function reviewSubOrder(
     if (user.role === 'wholesaler') {
       view.subOrders = view.subOrders.filter((s) => s.wholesalerId === user.tenantId);
     }
-    return view;
+    return { view, orderId: sub.orderId, subOrderId, action, rejectReason: rejectReason?.trim(), clientId: view.clientId };
+  }).then(async (result) => {
+    try {
+      const { notifySubOrderReviewed } = await import('../email/notify');
+      await notifySubOrderReviewed({
+        orderId: result.orderId,
+        subOrderId: result.subOrderId,
+        clientId: result.clientId,
+        status: result.action,
+        rejectReason: result.rejectReason,
+      });
+    } catch (err: any) {
+      console.warn('[notify] suborder review:', err?.message || err);
+    }
+    return result.view;
   });
 }
 

@@ -36,6 +36,20 @@
       "when": 1761180000000,
       "tag": "0004_voice",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1761190000000,
+      "tag": "0005_auth_email",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1761200000000,
+      "tag": "0006_wholesaler_applications",
+      "breakpoints": true
     }
   ]
 }

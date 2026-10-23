@@ -21,8 +21,48 @@ export const users = pgTable('users', {
   phone: text('phone').unique(),
   storeName: text('store_name'),
   status: text('status').default('active').notNull(),
+  emailVerifiedAt: timestamp('email_verified_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+export const passwordResetTokens = pgTable(
+  'password_reset_tokens',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull(),
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: timestamp('expires_at').notNull(),
+    usedAt: timestamp('used_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('password_reset_tokens_token_hash_uidx').on(table.tokenHash),
+    index('password_reset_tokens_user_id_idx').on(table.userId),
+  ]
+);
+
+export const emailOutbox = pgTable(
+  'email_outbox',
+  {
+    id: text('id').primaryKey(),
+    eventKey: text('event_key').notNull(),
+    template: text('template').notNull(),
+    toEmail: text('to_email').notNull(),
+    toUserId: text('to_user_id'),
+    subject: text('subject').notNull(),
+    payload: jsonb('payload').notNull(),
+    status: text('status').default('pending').notNull(),
+    attempts: integer('attempts').default(0).notNull(),
+    lastError: text('last_error'),
+    scheduledAt: timestamp('scheduled_at').defaultNow().notNull(),
+    sentAt: timestamp('sent_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('email_outbox_event_key_uidx').on(table.eventKey),
+    index('email_outbox_status_scheduled_idx').on(table.status, table.scheduledAt),
+  ]
+);
 
 export const products = pgTable(
   'products',
@@ -304,6 +344,32 @@ export const voiceTranscripts = pgTable(
   (table) => [
     index('voice_transcripts_client_id_idx').on(table.clientId),
     uniqueIndex('voice_transcripts_submission_key_uidx').on(table.submissionKey),
+  ]
+);
+
+/** Public wholesaler onboarding requests — privileges granted only after admin approval. */
+export const wholesalerApplications = pgTable(
+  'wholesaler_applications',
+  {
+    id: text('id').primaryKey(),
+    businessName: text('business_name').notNull(),
+    applicantName: text('applicant_name').notNull(),
+    email: text('email').notNull(),
+    phone: text('phone').notNull(),
+    location: text('location').notNull(),
+    description: text('description').notNull(),
+    category: text('category').default('General Wholesale').notNull(),
+    status: text('status').default('pending').notNull(), // pending | approved | rejected
+    rejectReason: text('reject_reason'),
+    reviewedByUserId: text('reviewed_by_user_id'),
+    reviewedAt: timestamp('reviewed_at'),
+    wholesalerId: text('wholesaler_id').references(() => wholesalers.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('wholesaler_applications_status_idx').on(table.status),
+    index('wholesaler_applications_email_idx').on(table.email),
   ]
 );
 

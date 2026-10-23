@@ -158,6 +158,16 @@ export async function recordPayment(
   }).then(async (result) => {
     if ('invoice' in result) return result as { payment: PaymentView; invoice: Awaited<ReturnType<typeof getInvoiceForUser>> };
     const invoice = await getInvoiceForUser(user, result.invoiceId);
+    try {
+      const { notifyPaymentReceipt } = await import('../email/notify');
+      await notifyPaymentReceipt({
+        paymentId: result.payment.id,
+        clientId: result.payment.clientId,
+        amount: String(result.payment.amount),
+      });
+    } catch (err: any) {
+      console.warn('[notify] payment:', err?.message || err);
+    }
     return { payment: result.payment, invoice };
   });
 }

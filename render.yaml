@@ -1,0 +1,96 @@
+# Optional Render blueprint — persistent Node web service + cron for email outbox.
+services:
+  - type: web
+    name: peshawar-wholesale-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: EMAIL_WORKER_MODE
+        value: external
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: APP_BASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        sync: false
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MAIL_MODE
+        value: smtp
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: VOICE_UPLOAD_ROOT
+        value: /data/voice
+    disk:
+      name: voice-data
+      mountPath: /data
+      sizeGB: 1
+
+  - type: cron
+    name: peshawar-email-outbox
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    schedule: "*/2 * * * *"
+    dockerCommand: "npx tsx scripts/process-email-outbox-once.mjs"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: DATABASE_URL
+      - key: MAIL_MODE
+        value: smtp
+      - key: SMTP_HOST
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: SMTP_HOST
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: SMTP_USER
+      - key: SMTP_PASS
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: SMTP_PASS
+      - key: MAIL_FROM
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: MAIL_FROM
+      - key: APP_BASE_URL
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: APP_BASE_URL
+      - key: JWT_SECRET
+        fromService:
+          type: web
+          name: peshawar-wholesale-api
+          envVarKey: JWT_SECRET

@@ -6,13 +6,16 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",
+    "start": "tsx server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
-    "test": "tsx --test tests/auth.test.ts tests/auth.integration.test.ts tests/commerce.integration.test.ts tests/fulfillment.integration.test.ts tests/ai.integration.test.ts tests/voice.unit.test.ts tests/voice.integration.test.ts",
+    "email:process-once": "tsx scripts/process-email-outbox-once.mjs",
+    "admin:bootstrap": "tsx scripts/bootstrap-admin-once.mjs",
+    "test": "tsx --test tests/auth.test.ts tests/auth.integration.test.ts tests/auth.password-reset.integration.test.ts tests/email.outbox.unit.test.ts tests/commerce.integration.test.ts tests/fulfillment.integration.test.ts tests/ai.integration.test.ts tests/voice.unit.test.ts tests/voice.integration.test.ts tests/insights.unit.test.ts tests/wholesaler-applications.integration.test.ts tests/ux.safeFetch.unit.test.ts",
     "test:auth": "tsx --test tests/auth.test.ts tests/auth.integration.test.ts",
     "test:commerce": "tsx --test tests/commerce.integration.test.ts",
     "test:fulfillment": "tsx --test tests/fulfillment.integration.test.ts",
@@ -20,7 +23,8 @@
     "test:voice": "tsx --test tests/voice.unit.test.ts tests/voice.integration.test.ts",
     "smoke:ai": "node scripts/ai-smoke.mjs",
     "smoke:voice": "node scripts/voice-smoke.mjs",
-    "demo:e2e": "node scripts/demo-e2e.mjs"
+    "demo:e2e": "node scripts/demo-e2e.mjs",
+    "smtp:verify": "node scripts/smtp-verify.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -34,9 +38,11 @@
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "multer": "^2.5.0",
+    "nodemailer": "^6.10.1",
     "pg": "^8.23.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
+    "tsx": "^4.21.0",
     "vite": "^8.3.0"
   },
   "devDependencies": {
@@ -45,6 +51,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.3.0",
     "@types/node": "^22.14.0",
+    "@types/nodemailer": "^6.4.17",
     "@types/pg": "^8.23.1",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
@@ -52,7 +59,9 @@
     "drizzle-kit": "^0.31.11",
     "esbuild": "0.28.0",
     "tailwindcss": "^4.3.3",
-    "tsx": "^4.21.0",
     "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

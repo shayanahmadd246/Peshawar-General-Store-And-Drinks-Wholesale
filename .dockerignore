@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.cursor
+uploads
+presentation
+.env
+.env.*
+!.env.example
+*.md
+agent-transcripts
+terminals
+coverage
+.tmp

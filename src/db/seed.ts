@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getDb } from './index';
@@ -235,7 +235,7 @@ export async function seedDevelopmentData(): Promise<void> {
       id: 'CLI-01',
       name: 'Babar Khan',
       storeName: 'Babar General Store',
-      email: null,
+      email: 'babar@market.pk',
       phone: creds.clientPhone,
       passwordHash: clientHash,
       role: 'client',
@@ -243,6 +243,11 @@ export async function seedDevelopmentData(): Promise<void> {
       status: 'active',
     })
     .onConflictDoNothing({ target: users.id });
+
+  // Backfill demo email for existing shopkeeper rows (additive; never clears a set email)
+  await getDb().execute(
+    sql`UPDATE users SET email = 'babar@market.pk' WHERE id = 'CLI-01' AND (email IS NULL OR email = '')`
+  );
 
   const deliveryHash = await hashPassword(creds.deliveryPassword);
   await getDb()

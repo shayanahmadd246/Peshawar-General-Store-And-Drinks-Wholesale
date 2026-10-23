@@ -4,11 +4,18 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const UPLOAD_ROOT = path.resolve(__dirname, '../../../uploads/voice');
+
+/** Prefer VOICE_UPLOAD_ROOT (persistent volume) in production; local uploads/ otherwise. */
+function resolveUploadRoot(): string {
+  const fromEnv = process.env.VOICE_UPLOAD_ROOT?.trim();
+  if (fromEnv) return path.resolve(fromEnv);
+  return path.resolve(__dirname, '../../../uploads/voice');
+}
 
 export async function ensureVoiceUploadDir(): Promise<string> {
-  await fs.mkdir(UPLOAD_ROOT, { recursive: true });
-  return UPLOAD_ROOT;
+  const root = resolveUploadRoot();
+  await fs.mkdir(root, { recursive: true });
+  return root;
 }
 
 export function checksumBuffer(buffer: Buffer): string {
@@ -35,7 +42,8 @@ export async function saveVoiceBuffer(input: {
 export async function readVoiceRelative(relativePath: string): Promise<Buffer> {
   const root = await ensureVoiceUploadDir();
   const absolute = path.resolve(root, relativePath);
-  if (!absolute.startsWith(root)) {
+  const normalizedRoot = path.resolve(root);
+  if (!absolute.startsWith(normalizedRoot + path.sep) && absolute !== normalizedRoot) {
     throw new Error('Invalid audio path.');
   }
   return fs.readFile(absolute);

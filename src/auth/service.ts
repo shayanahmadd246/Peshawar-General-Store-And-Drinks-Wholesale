@@ -96,22 +96,36 @@ export async function registerClient(input: {
   storeName: string;
   phone: string;
   password?: string;
+  email?: string;
 }): Promise<{ user: AuthUser; token: string }> {
   const name = input.name.trim();
   const storeName = input.storeName.trim();
   const phone = input.phone.trim();
+  const email = input.email?.trim().toLowerCase() || null;
   if (!name || !storeName || !phone) {
     throw new HttpError(400, 'Name, store name and phone number are required.');
+  }
+  if (email && !email.includes('@')) {
+    throw new HttpError(400, 'Enter a valid email address.');
   }
 
   const existing = await findUserByPhone(phone);
   if (existing) {
     throw new HttpError(409, 'This phone number is already registered. Please sign in.');
   }
+  if (email) {
+    const byEmail = await findUserByEmail(email);
+    if (byEmail) {
+      throw new HttpError(409, 'This email is already registered. Please sign in.');
+    }
+  }
 
   const password = input.password || (allowClientDemoPasswordFallback() ? getSeedCredentials().clientPassword : '');
   if (!password) {
     throw new HttpError(400, 'Password is required.');
+  }
+  if (password.length < 8) {
+    throw new HttpError(400, 'Password must be at least 8 characters.');
   }
 
   const id = `CLI-${Date.now()}`;
@@ -122,7 +136,7 @@ export async function registerClient(input: {
       name,
       storeName,
       phone,
-      email: null,
+      email,
       passwordHash: await hashPassword(password),
       role: 'client',
       tenantId: null,

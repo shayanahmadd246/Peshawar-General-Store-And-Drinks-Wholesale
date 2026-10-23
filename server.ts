@@ -10,7 +10,13 @@ import { wholesalers as wholesalersTable } from './src/db/schema';
 import { runMigrations } from './src/db/migrate';
 import { seedDevelopmentData } from './src/db/seed';
 import { authenticate, authorize, optionalAuthenticate } from './src/middleware/auth';
-import { authRateLimit } from './src/middleware/rateLimit';
+import { authRateLimit, publicFormRateLimit } from './src/middleware/rateLimit';
+import {
+  approveWholesalerApplication,
+  listWholesalerApplications,
+  rejectWholesalerApplication,
+  submitWholesalerApplication,
+} from './src/auth/wholesalerApplications';
 import { aiChatRateLimit } from './src/middleware/aiRateLimit';
 import { voiceTtsRateLimit, voiceUploadRateLimit } from './src/middleware/voiceRateLimit';
 import { handleShopkeeperChat } from './src/ai/orchestrator';
@@ -33,8 +39,14 @@ import {
   setWholesalerStatus,
   writeAudit,
 } from './src/auth/service';
+import { changePassword, requestPasswordReset, resetPasswordWithToken } from './src/auth/passwordReset';
 import { HttpError } from './src/auth/rbac';
 import { isProduction } from './src/config/env';
+import { getMailMode } from './src/email/config';
+import { enqueueEmail, getOutboxStats, processEmailOutbox, startEmailOutboxWorker } from './src/email/outbox';
+import { notifyWelcomeShopkeeper } from './src/email/notify';
+import { corsMiddleware } from './src/middleware/cors';
+import { ensureProductionBootstrap } from './src/auth/bootstrapAdmin';
 import { getMarketData } from './src/commerce/market';
 import {
   addToCart,
@@ -68,7 +80,9 @@ dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json());
+app.set('trust proxy', 1);
+app.use(corsMiddleware);
+app.use(express.json({ limit: '1mb' }));
 
 function handleHttpError(err: unknown, res: express.Response, fallback: string) {
   if (err instanceof HttpError) {
@@ -87,6 +101,22 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 
+/** External scheduler / host cron — does not rely on serverless in-process timers. */
+app.post('/api/internal/email/process', async (req, res) => {
+  try {
+    const secret = process.env.CRON_SECRET?.trim();
+    if (!secret || req.get('x-cron-secret') !== secret) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const limit = Math.min(Number(req.body?.limit || 40), 100);
+    const result = await processEmailOutbox(limit);
+    const stats = await getOutboxStats();
+    res.json({ success: true, ...result, stats });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to process email outbox.');
+  }
+});
+
 app.get('/api/market/data', optionalAuthenticate, async (req, res) => {
   try {
     const data = await getMarketData(req.user);
@@ -96,12 +126,15 @@ app.get('/api/market/data', optionalAuthenticate, async (req, res) => {
   }
 });
 
+const AUTH_FAIL = 'Invalid credentials.';
+
 app.post('/api/auth/client/signup', authRateLimit, async (req, res) => {
   try {
-    const { name, storeName, phone, password } = req.body;
-    const { user, token } = await registerClient({ name, storeName, phone, password });
-    const client = { id: user.id, name: user.name, storeName: user.storeName || storeName, phone: user.phone || phone };
+    const { name, storeName, phone, password, email } = req.body;
+    const { user, token } = await registerClient({ name, storeName, phone, password, email });
+    const client = { id: user.id, name: user.name, storeName: user.storeName || storeName, phone: user.phone || phone, email: user.email };
     await writeAudit(name, 'Shopkeeper', 'CLIENT_SIGNUP', `New client signed up: ${storeName} (${phone})`);
+    void notifyWelcomeShopkeeper(user.id).catch(() => undefined);
     res.json({ success: true, token, client, user: publicUser(user) });
   } catch (err) {
     handleHttpError(err, res, 'Client signup failed.');
@@ -117,11 +150,12 @@ app.post('/api/auth/client/signin', authRateLimit, async (req, res) => {
       name: user.name,
       storeName: user.storeName || '',
       phone: user.phone || phone,
+      email: user.email,
     };
     res.json({ success: true, token, client, user: publicUser(user) });
   } catch (err) {
-    if (err instanceof HttpError && err.status === 401) {
-      return res.status(401).json({ error: 'Client not found with this phone number. Please sign up first.' });
+    if (err instanceof HttpError && (err.status === 401 || err.status === 400)) {
+      return res.status(401).json({ error: AUTH_FAIL });
     }
     handleHttpError(err, res, 'Client sign in failed.');
   }
@@ -132,11 +166,11 @@ app.post('/api/auth/wholesaler/signin', authRateLimit, async (req, res) => {
     const { email, password } = req.body;
     const { user, token } = await authenticateUser({ email, password, expectedRole: 'wholesaler' });
     if (!user.tenantId) {
-      return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
+      return res.status(401).json({ error: AUTH_FAIL });
     }
     const [wholesaler] = await getDb().select().from(wholesalersTable).where(eq(wholesalersTable.id, user.tenantId)).limit(1);
     if (!wholesaler) {
-      return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
+      return res.status(401).json({ error: AUTH_FAIL });
     }
     res.json({
       success: true,
@@ -155,10 +189,10 @@ app.post('/api/auth/wholesaler/signin', authRateLimit, async (req, res) => {
     });
   } catch (err) {
     if (err instanceof HttpError && err.status === 401) {
-      return res.status(401).json({ error: 'Wrong email or password. Please check your credentials.' });
+      return res.status(401).json({ error: AUTH_FAIL });
     }
     if (err instanceof HttpError && err.status === 403) {
-      return res.status(403).json({ error: 'This wholesaler account has been suspended by Admin.' });
+      return res.status(403).json({ error: 'This account has been suspended.' });
     }
     handleHttpError(err, res, 'Wholesaler sign in failed.');
   }
@@ -176,7 +210,7 @@ app.post('/api/auth/admin/signin', authRateLimit, async (req, res) => {
     });
   } catch (err) {
     if (err instanceof HttpError && err.status === 401) {
-      return res.status(401).json({ error: 'Wrong admin email or password.' });
+      return res.status(401).json({ error: AUTH_FAIL });
     }
     handleHttpError(err, res, 'Admin sign in failed.');
   }
@@ -194,9 +228,128 @@ app.post('/api/auth/delivery/signin', authRateLimit, async (req, res) => {
     });
   } catch (err) {
     if (err instanceof HttpError && err.status === 401) {
-      return res.status(401).json({ error: 'Wrong delivery email or password.' });
+      return res.status(401).json({ error: AUTH_FAIL });
     }
     handleHttpError(err, res, 'Delivery sign in failed.');
+  }
+});
+
+app.post('/api/auth/password/forgot', authRateLimit, async (req, res) => {
+  try {
+    const { email, phone } = req.body || {};
+    await requestPasswordReset({ email, phone });
+    // Always generic — do not reveal account existence
+    res.json({
+      success: true,
+      message: 'If an account with that email or phone exists and has a notification email on file, a reset link has been queued.',
+    });
+  } catch (err) {
+    handleHttpError(err, res, 'Unable to process password reset.');
+  }
+});
+
+app.post('/api/auth/password/reset', authRateLimit, async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    await resetPasswordWithToken({ token, newPassword });
+    res.json({ success: true, message: 'Password updated. You can sign in with your new password.' });
+  } catch (err) {
+    handleHttpError(err, res, 'Unable to reset password.');
+  }
+});
+
+app.post('/api/auth/password/change', authenticate, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    await changePassword(req.user!.id, currentPassword, newPassword);
+    res.json({ success: true });
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 401) {
+      return res.status(401).json({ error: AUTH_FAIL });
+    }
+    handleHttpError(err, res, 'Unable to change password.');
+  }
+});
+
+app.get('/api/admin/email/outbox', authenticate, authorize(['admin']), async (_req, res) => {
+  try {
+    const stats = await getOutboxStats();
+    res.json({ success: true, mode: getMailMode(), stats });
+  } catch (err) {
+    handleHttpError(err, res, 'Unable to load email outbox.');
+  }
+});
+
+app.post('/api/admin/email/process', authenticate, authorize(['admin']), async (_req, res) => {
+  try {
+    const result = await processEmailOutbox(50);
+    res.json({ success: true, mode: getMailMode(), ...result });
+  } catch (err) {
+    handleHttpError(err, res, 'Unable to process email outbox.');
+  }
+});
+
+app.post('/api/admin/email/test', authenticate, authorize(['admin']), authRateLimit, async (req, res) => {
+  try {
+    const to = String(req.body?.to || req.user?.email || '').trim().toLowerCase();
+    if (!to || !to.includes('@')) {
+      return res.status(400).json({ error: 'Provide a valid to email.' });
+    }
+    const queued = await enqueueEmail({
+      eventKey: `test_ping:${to}:${Date.now()}`,
+      template: 'test_ping',
+      toEmail: to,
+      toUserId: req.user!.id,
+      payload: { detail: `Sent by admin ${req.user!.name} at ${new Date().toISOString()}` },
+    });
+    const processed = await processEmailOutbox(5);
+    res.json({ success: true, queued, processed, mode: getMailMode() });
+  } catch (err) {
+    handleHttpError(err, res, 'Unable to send test email.');
+  }
+});
+
+app.post('/api/wholesaler-applications', publicFormRateLimit, async (req, res) => {
+  try {
+    const result = await submitWholesalerApplication(req.body || {});
+    res.status(201).json({ success: true, ...result });
+  } catch (err) {
+    handleHttpError(err, res, 'Unable to submit application.');
+  }
+});
+
+app.get('/api/wholesaler-applications', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const applications = await listWholesalerApplications(status);
+    res.json({ success: true, applications });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to list applications.');
+  }
+});
+
+app.post('/api/wholesaler-applications/:id/approve', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const result = await approveWholesalerApplication(req.params.id, {
+      id: req.user!.id,
+      name: req.user!.name || 'Admin',
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to approve application.');
+  }
+});
+
+app.post('/api/wholesaler-applications/:id/reject', authenticate, authorize(['admin']), async (req, res) => {
+  try {
+    const result = await rejectWholesalerApplication(
+      req.params.id,
+      { id: req.user!.id, name: req.user!.name || 'Admin' },
+      typeof req.body?.reason === 'string' ? req.body.reason : undefined
+    );
+    res.json({ success: true, ...result });
+  } catch (err) {
+    handleHttpError(err, res, 'Failed to reject application.');
   }
 });
 
@@ -744,9 +897,11 @@ if (process.env.NODE_ENV !== 'production') {
   });
   app.use(vite.middlewares);
 } else {
-  app.use(express.static(path.join(__dirname, 'dist')));
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  const distDir = path.join(__dirname, 'dist');
+  app.use(express.static(distDir, { index: false, maxAge: '1h' }));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next();
+    res.sendFile(path.join(distDir, 'index.html'));
   });
 }
 
@@ -757,11 +912,19 @@ async function start() {
     await runMigrations();
     if (!isProduction()) {
       await seedDevelopmentData();
+    } else {
+      await ensureProductionBootstrap();
     }
     const connected = await checkDatabaseConnection();
+    // Prefer in-process worker on persistent hosts; set EMAIL_WORKER_MODE=external for cron-only.
+    if (process.env.EMAIL_WORKER_MODE !== 'external') {
+      startEmailOutboxWorker();
+    }
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Wholesale Market Platform running on http://localhost:${PORT}`);
+      console.log(`Wholesale Market Platform listening on 0.0.0.0:${PORT}`);
       console.log(`Database: ${connected ? 'connected' : 'disconnected'}`);
+      console.log(`Mail mode: ${getMailMode()}`);
+      console.log(`App base URL: ${process.env.APP_BASE_URL || '(unset)'}`);
     });
   } catch (err) {
     console.error('Failed to start server. PostgreSQL must be configured before the demo can run.');

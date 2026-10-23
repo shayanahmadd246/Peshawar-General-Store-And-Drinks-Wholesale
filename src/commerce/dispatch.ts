@@ -180,7 +180,27 @@ export async function assignShipment(
       details: `Assigned shipment ${shipmentId} to ${updated.assigneeName}`,
     });
 
-    return mapShipment(updated);
+    const [ord] = await tx.select().from(orders).where(eq(orders.id, updated.orderId)).limit(1);
+    return {
+      shipment: mapShipment(updated, {
+        clientName: ord?.clientName,
+        deliveryAddress: ord?.deliveryAddress,
+      }),
+      assigneeId: assignee.id,
+    };
+  }).then(async (result) => {
+    try {
+      const { notifyShipmentAssigned } = await import('../email/notify');
+      await notifyShipmentAssigned({
+        shipmentId: result.shipment.id,
+        orderId: result.shipment.orderId,
+        assigneeId: result.assigneeId,
+        deliveryAddress: result.shipment.deliveryAddress,
+      });
+    } catch (err: any) {
+      console.warn('[notify] shipment assigned:', err?.message || err);
+    }
+    return result.shipment;
   });
 }
 
@@ -206,7 +226,17 @@ export async function updateShipmentStatus(
         .from(shipments)
         .where(eq(shipments.statusIdempotencyKey, input.idempotencyKey))
         .limit(1);
-      if (byKey) return mapShipment(byKey);
+      if (byKey) {
+        const [ord] = await tx.select().from(orders).where(eq(orders.id, byKey.orderId)).limit(1);
+        return {
+          shipment: mapShipment(byKey),
+          clientId: ord?.clientId || '',
+          invoiceNumber: null as string | null,
+          nextStatus: byKey.status,
+          failureReason: undefined as string | undefined,
+          skipNotify: true,
+        };
+      }
     }
 
     const locked = await tx.execute(sql`SELECT * FROM shipments WHERE id = ${shipmentId} FOR UPDATE`);
@@ -238,7 +268,15 @@ export async function updateShipmentStatus(
     assertCanMutateShipment(user, shipment);
 
     if (shipment.status === nextStatus) {
-      return mapShipment(shipment);
+      const [ordSame] = await tx.select().from(orders).where(eq(orders.id, shipment.orderId)).limit(1);
+      return {
+        shipment: mapShipment(shipment),
+        clientId: ordSame?.clientId || '',
+        invoiceNumber: null as string | null,
+        nextStatus,
+        failureReason: undefined as string | undefined,
+        skipNotify: true,
+      };
     }
 
     const allowed = TRANSITIONS[shipment.status as ShipmentStatus] || [];
@@ -319,7 +357,42 @@ export async function updateShipmentStatus(
       details: `Shipment ${shipmentId} moved to ${nextStatus}`,
     });
 
-    return mapShipment(updated);
+    const [ord] = await tx.select().from(orders).where(eq(orders.id, updated.orderId)).limit(1);
+    let invoiceNumber: string | null = null;
+    if (nextStatus === 'Delivered' && updated.subOrderId) {
+      const { invoices } = await import('../db/schema');
+      const [inv] = await tx.select().from(invoices).where(eq(invoices.subOrderId, updated.subOrderId)).limit(1);
+      invoiceNumber = inv?.invoiceNumber || null;
+    }
+
+    return {
+      shipment: mapShipment(updated, {
+        clientName: ord?.clientName,
+        deliveryAddress: ord?.deliveryAddress,
+      }),
+      clientId: ord?.clientId || '',
+      invoiceNumber,
+      nextStatus,
+      failureReason: input.failureReason,
+      skipNotify: false,
+    };
+  }).then(async (result) => {
+    if (result.clientId && !result.skipNotify) {
+      try {
+        const { notifyShipmentStatus } = await import('../email/notify');
+        await notifyShipmentStatus({
+          shipmentId: result.shipment.id,
+          orderId: result.shipment.orderId,
+          clientId: result.clientId,
+          status: result.nextStatus,
+          failureReason: result.failureReason,
+          invoiceNumber: result.invoiceNumber,
+        });
+      } catch (err: any) {
+        console.warn('[notify] shipment status:', err?.message || err);
+      }
+    }
+    return result.shipment;
   });
 }
 
